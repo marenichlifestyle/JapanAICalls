@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from aiogram import Bot, Dispatcher
+
+from app.bot.handlers import create_router
+from app.config import get_settings
+from app.logging_config import setup_logging
+from app.services.elevenlabs_client import ElevenLabsService
+from app.services.openai_client import OpenAIService
+from app.services.workflow import CallWorkflow
+
+logger = logging.getLogger(__name__)
+
+
+async def main() -> None:
+    settings = get_settings()
+    setup_logging(settings.log_level)
+    logger.info("WEBHOOK_BASE_URL=%s", settings.normalized_webhook_base_url)
+    logger.info("ElevenLabs webhook URL: %s", settings.elevenlabs_webhook_endpoint)
+    logger.info("TEST_MODE=%s", settings.test_mode)
+    logger.info("TEST_CALL_PHONE=%s", settings.test_call_phone)
+    for warning in settings.runtime_warnings():
+        logger.warning(warning)
+
+    bot = Bot(token=settings.telegram_bot_token)
+    dp = Dispatcher()
+    workflow = CallWorkflow(
+        settings=settings,
+        openai_service=OpenAIService(settings),
+        elevenlabs_service=ElevenLabsService(settings),
+    )
+    dp.include_router(create_router(settings, workflow=workflow))
+
+    queue_task = asyncio.create_task(workflow.run_queue_worker(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        queue_task.cancel()
+        try:
+            await queue_task
+        except asyncio.CancelledError:
+            pass
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

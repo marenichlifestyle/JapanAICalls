@@ -1,0 +1,31 @@
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local databases and backups
+dev.db
+*.sqlite
+*.sqlite3
+backups/
+*.dump
+*.sql
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime artifacts
+*.log

@@ -1,0 +1,34 @@
+# Secrets and local env files
+.env
+.env.*
+!.env.example
+
+# Python/local tooling
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Local databases, backups and generated artifacts
+dev.db
+*.sqlite
+*.sqlite3
+backups/
+*.dump
+*.sql
+
+# VCS/editor/system files
+.git/
+.gitignore
+.DS_Store
+.idea/
+.vscode/
+
+# Test/build noise not needed in runtime image
+.pytest_cache/
+.ruff_cache/
