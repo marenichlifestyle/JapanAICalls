@@ -10,7 +10,7 @@ from typing import Any
 import phonenumbers
 from aiogram import Bot
 from phonenumbers import NumberParseException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.keyboards import request_call_next_keyboard
@@ -102,6 +102,8 @@ DEALER_BRAND_LABELS = (
     ("hyundai", "a Hyundai dealership"),
     ("kia", "a Kia dealership"),
 )
+
+REQUEST_CALL_FINALIZATION_LOCK_CLASS_ID = 62041
 
 
 @dataclass
@@ -252,6 +254,18 @@ def _status_label(status: str | None) -> str:
         "timeout": "таймаут",
         "canceled": "отменён",
     }.get(status or "", status or "—")
+
+
+async def _try_acquire_request_call_finalization_lock(session: AsyncSession, job_id: int) -> bool:
+    """Prevent webhook and fallback workers from finalizing the same call at once."""
+    bind = session.get_bind()
+    if bind.dialect.name != "postgresql":
+        return True
+    result = await session.execute(
+        text("SELECT pg_try_advisory_xact_lock(:class_id, :job_id)"),
+        {"class_id": REQUEST_CALL_FINALIZATION_LOCK_CLASS_ID, "job_id": int(job_id)},
+    )
+    return bool(result.scalar())
 
 
 def _html_value(value: str | None, *, limit: int = 260) -> str | None:
@@ -1175,9 +1189,34 @@ class RequestCallService:
     ) -> None:
         if not job.request_campaign_id or not job.request_target_id:
             return
+        if not await _try_acquire_request_call_finalization_lock(session, job.id):
+            logger.info(
+                "request-call finalization skipped: another worker holds lock",
+                extra={"job_id": job.id},
+            )
+            return
+        await session.refresh(job)
         campaign = await session.get(RequestCallCampaign, job.request_campaign_id)
         target = await session.get(DealerCallTarget, job.request_target_id)
         if not campaign or not target:
+            return
+        existing_report = await self._latest_target_report(
+            session=session,
+            campaign_id=campaign.id,
+            target_id=target.id,
+        )
+        if existing_report is not None:
+            logger.info(
+                "request-call finalization skipped: target already has report",
+                extra={
+                    "job_id": job.id,
+                    "campaign_id": campaign.id,
+                    "target_id": target.id,
+                    "report_id": existing_report.id,
+                },
+            )
+            if bot is not None and job.final_report_error and not job.final_report_sent_at:
+                await self.send_target_report(session=session, campaign=campaign, target=target, bot=bot, job=job)
             return
         report = await self._extract_call_report(transcript=transcript, goal_ru=job.request_goal_ru or target.goal_ru or "")
         await self._persist_report(session=session, campaign=campaign, target=target, report=report)
@@ -1203,9 +1242,35 @@ class RequestCallService:
     ) -> None:
         if not job.request_campaign_id or not job.request_target_id:
             return
+        if not await _try_acquire_request_call_finalization_lock(session, job.id):
+            logger.info(
+                "request-call status finalization skipped: another worker holds lock",
+                extra={"job_id": job.id, "call_status": call_status},
+            )
+            return
+        await session.refresh(job)
         campaign = await session.get(RequestCallCampaign, job.request_campaign_id)
         target = await session.get(DealerCallTarget, job.request_target_id)
         if not campaign or not target:
+            return
+        existing_report = await self._latest_target_report(
+            session=session,
+            campaign_id=campaign.id,
+            target_id=target.id,
+        )
+        if existing_report is not None:
+            logger.info(
+                "request-call status finalization skipped: target already has report",
+                extra={
+                    "job_id": job.id,
+                    "campaign_id": campaign.id,
+                    "target_id": target.id,
+                    "report_id": existing_report.id,
+                    "call_status": call_status,
+                },
+            )
+            if bot is not None and job.final_report_error and not job.final_report_sent_at:
+                await self.send_target_report(session=session, campaign=campaign, target=target, bot=bot, job=job)
             return
         next_action = None
         if call_status in {"no_answer", "busy"}:
@@ -1228,6 +1293,21 @@ class RequestCallService:
         await session.commit()
         if bot is not None:
             await self.send_target_report(session=session, campaign=campaign, target=target, bot=bot, job=job)
+
+    async def _latest_target_report(
+        self,
+        *,
+        session: AsyncSession,
+        campaign_id: int,
+        target_id: int,
+    ) -> CallReport | None:
+        stmt = (
+            select(CallReport)
+            .where(CallReport.campaign_id == campaign_id, CallReport.target_id == target_id)
+            .order_by(CallReport.id.desc())
+            .limit(1)
+        )
+        return (await session.execute(stmt)).scalar_one_or_none()
 
     async def _mark_report_delivery(self, *, session: AsyncSession, job: Job | None, success: bool) -> None:
         if job is None:

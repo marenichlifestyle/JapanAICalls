@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings
@@ -737,6 +738,56 @@ async def test_request_call_starts_one_call_with_goal_ru_only_and_waits_next() -
         assert "not_answered" not in report_text
         assert "VIN/stock" not in report_text
         assert "Оплата/документы" in report_text
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_call_finalization_is_idempotent_for_webhook_and_fallback_race() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    bot = FakeBot()
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text=(
+                "Duval Ford Jacksonville +1 (904) 387-6541\n"
+                "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки."
+            ),
+        )
+        campaign = await service.set_language_and_generate_goals(
+            session=session,
+            campaign=campaign,
+            call_language="en",
+        )
+        job = await service.start_next_call(session=session, campaign=campaign, bot=bot)
+        assert job is not None
+
+        await service.finalize_job_from_transcript(
+            session=session,
+            job=job,
+            bot=bot,
+            transcript="agent: hello\nuser: incoming unit is possible",
+            summary="completed",
+        )
+        await service.finalize_job_from_transcript(
+            session=session,
+            job=job,
+            bot=bot,
+            transcript="agent: hello again\nuser: duplicate webhook payload",
+            summary="completed duplicate",
+        )
+
+        reports = (await session.execute(select(CallReport).where(CallReport.target_id == job.request_target_id))).scalars().all()
+        assert len(reports) == 1
+        report_messages = [row for row in bot.messages if "Отчёт:" in row["text"]]
+        assert len(report_messages) == 1
     await engine.dispose()
 
 

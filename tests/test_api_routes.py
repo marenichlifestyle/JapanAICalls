@@ -21,7 +21,10 @@ async def test_webhook_route_and_root_404() -> None:
         async with session_maker() as session:
             yield session
 
+    old_elevenlabs_secret = main.settings.elevenlabs_webhook_secret
+    old_twilio_token = main.settings.twilio_webhook_auth_token
     main.settings.elevenlabs_webhook_secret = ""
+    main.settings.twilio_webhook_auth_token = ""
     main.app.dependency_overrides[main.get_session] = override_get_session
 
     transport = httpx.ASGITransport(app=main.app)
@@ -51,6 +54,8 @@ async def test_webhook_route_and_root_404() -> None:
         assert tw.json() == {"ok": True}
 
     main.app.dependency_overrides.clear()
+    main.settings.elevenlabs_webhook_secret = old_elevenlabs_secret
+    main.settings.twilio_webhook_auth_token = old_twilio_token
     await engine.dispose()
 
 
