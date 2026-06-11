@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeDefault
 
 from app.bot.handlers import create_router
 from app.config import get_settings
@@ -13,6 +14,20 @@ from app.services.openai_client import OpenAIService
 from app.services.workflow import CallWorkflow
 
 logger = logging.getLogger(__name__)
+
+
+async def configure_bot_commands(bot: Bot) -> None:
+    commands = [BotCommand(command="start", description="Выбрать режим прозвона")]
+    scopes = (
+        BotCommandScopeDefault(),
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+    )
+    for scope in scopes:
+        try:
+            await bot.set_my_commands(commands, scope=scope)
+        except Exception:
+            logger.exception("failed to set telegram bot commands", extra={"status": scope.type})
 
 
 async def main() -> None:
@@ -26,6 +41,7 @@ async def main() -> None:
         logger.warning(warning)
 
     bot = Bot(token=settings.telegram_bot_token)
+    await configure_bot_commands(bot)
     dp = Dispatcher()
     workflow = CallWorkflow(
         settings=settings,

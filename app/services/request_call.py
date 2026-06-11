@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -9,6 +10,7 @@ from typing import Any
 
 import phonenumbers
 from aiogram import Bot
+from aiogram.types import BufferedInputFile
 from phonenumbers import NumberParseException
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +23,7 @@ from app.services.call_state import classify_twilio_create_failure, extract_twil
 from app.services.elevenlabs_client import ElevenLabsService, ProviderCallCreateError
 from app.services.openai_client import OpenAIService
 from app.services.request_call_context import RequestCallContextExtractor
-from app.services.telegram_delivery import safe_delete_message, safe_send_message
+from app.services.telegram_delivery import safe_delete_message, safe_send_document, safe_send_message
 from app.utils.phone import is_special_or_proxy_phone, normalize_jp_phone_to_e164, normalize_us_phone_to_e164
 
 logger = logging.getLogger(__name__)
@@ -1426,6 +1428,8 @@ class RequestCallService:
         report_html = build_request_target_report_html(target, report)
         targets = await self.list_targets(session, campaign.id)
         remaining = any(row.status == "pending" for row in targets)
+        if job is not None:
+            await self._send_request_call_audio(campaign=campaign, target=target, job=job, bot=bot)
         sent = await safe_send_message(bot, campaign.telegram_chat_id, report_html, parse_mode="HTML")
         success = bool(sent)
         if remaining and success:
@@ -1452,6 +1456,49 @@ class RequestCallService:
             success = bool(sent) and summary_sent
         await self._mark_report_delivery(session=session, job=job, success=success)
         return success
+
+    async def _send_request_call_audio(
+        self,
+        *,
+        campaign: RequestCallCampaign,
+        target: DealerCallTarget,
+        job: Job,
+        bot: Bot,
+    ) -> bool:
+        if not job.elevenlabs_conversation_id:
+            return False
+        audio: bytes | None = None
+        for attempt in range(1, 4):
+            try:
+                audio = await self.elevenlabs_service.fetch_conversation_audio(job.elevenlabs_conversation_id)
+                if audio:
+                    break
+            except Exception as exc:
+                logger.warning(
+                    "request-call audio fetch failed",
+                    extra={
+                        "job_id": job.id,
+                        "conversation_id": job.elevenlabs_conversation_id,
+                        "status": f"attempt {attempt}/3: {type(exc).__name__}: {exc}",
+                    },
+                )
+            if attempt < 3:
+                await asyncio.sleep(2)
+        if not audio:
+            logger.warning(
+                "request-call audio is not available",
+                extra={"job_id": job.id, "conversation_id": job.elevenlabs_conversation_id},
+            )
+            return False
+        document = BufferedInputFile(audio, filename=f"request_call_{job.id}.mp3")
+        sent = await safe_send_document(
+            bot,
+            campaign.telegram_chat_id,
+            document,
+            caption=f"Аудио звонка: {target.dealer_name}",
+            reply_to_message_id=campaign.telegram_source_message_id,
+        )
+        return bool(sent)
 
     async def send_campaign_summary(self, *, session: AsyncSession, campaign: RequestCallCampaign, bot: Bot) -> bool:
         reports = await self.list_reports(session, campaign.id)

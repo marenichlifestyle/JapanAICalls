@@ -30,12 +30,18 @@ from app.services.request_call import (
 class FakeBot:
     def __init__(self) -> None:
         self.messages: list[dict] = []
+        self.documents: list[dict] = []
         self.deleted_messages: list[tuple[int, int]] = []
         self._next_message_id = 100
 
     async def send_message(self, chat_id: int, text: str, **kwargs):
         self._next_message_id += 1
         self.messages.append({"chat_id": chat_id, "text": text, "kwargs": kwargs})
+        return type("Msg", (), {"message_id": self._next_message_id})()
+
+    async def send_document(self, chat_id: int, document, **kwargs):
+        self._next_message_id += 1
+        self.documents.append({"chat_id": chat_id, "document": document, "kwargs": kwargs})
         return type("Msg", (), {"message_id": self._next_message_id})()
 
     async def delete_message(self, chat_id: int, message_id: int):
@@ -158,6 +164,10 @@ class FakeEleven(ElevenLabsService):
             }
         )
         return {"success": True, "conversation_id": "conv-request-1", "callSid": "sid-request-1"}
+
+    async def fetch_conversation_audio(self, conversation_id: str) -> bytes | None:
+        assert conversation_id == "conv-request-1"
+        return b"fake mp3 bytes"
 
 
 class CapturingOpenAI(OpenAIService):
@@ -530,13 +540,14 @@ def test_settings_admin_ids_parse_new_allowed_users() -> None:
     settings = Settings(
         TELEGRAM_BOT_TOKEN="TEST_TOKEN",
         TELEGRAM_ADMIN_IDS="929466979,1560959066,90791472",
-        TELEGRAM_ALLOWED_CHAT_IDS="5288422605",
+        TELEGRAM_ALLOWED_CHAT_IDS="5288422605,-1003969464648",
     )
     assert {929466979, 1560959066, 90791472}.issubset(settings.admin_ids)
     assert settings.is_allowed_telegram_chat(123, "private")
     assert settings.is_allowed_telegram_chat(5288422605, "group")
     assert settings.is_allowed_telegram_chat(-5288422605, "group")
     assert settings.is_allowed_telegram_chat(-1005288422605, "supergroup")
+    assert settings.is_allowed_telegram_chat(-1003969464648, "supergroup")
     assert not settings.is_allowed_telegram_chat(-1001111111111, "supergroup")
 
 
@@ -759,6 +770,8 @@ async def test_request_call_starts_one_call_with_goal_ru_only_and_waits_next() -
         assert "not_answered" not in report_text
         assert "VIN/stock" not in report_text
         assert "Оплата/документы" in report_text
+        assert bot.documents
+        assert bot.documents[0]["kwargs"]["caption"].startswith("Аудио звонка:")
     await engine.dispose()
 
 

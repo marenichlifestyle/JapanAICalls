@@ -82,7 +82,7 @@ cp .env.example .env
 Для режима `Прозвонить по запросу` задайте:
 - `ELEVENLABS_REQUEST_AGENT_ID` — English request-call агент.
 - `ELEVENLABS_REQUEST_AGENT_ID_JA` — Japanese request-call агент.
-Для работы в Telegram-группах задайте `TELEGRAM_ALLOWED_CHAT_IDS` и добавьте бота администратором в чат. Если бот не видит обычные сообщения в группе, отключите privacy mode через BotFather.
+Для работы в Telegram-группах задайте `TELEGRAM_ALLOWED_CHAT_IDS` и добавьте бота администратором в чат. Если бот не видит обычные сообщения в группе, отключите privacy mode через BotFather. Если Telegram апгрейднул обычную группу в supergroup, добавьте новый `-100...` chat ID в `TELEGRAM_ALLOWED_CHAT_IDS`.
 Рекомендуемый режим для production: не отправлять `prompt` override из кода, а задавать prompt и first message в ElevenLabs dashboard с переменными `{{car_spoken_ru}}`, `{{price_used_spoken_ru}}`.
 Если всё же хотите override prompt из кода, в ElevenLabs нужно включить:
 `Agent -> Security -> Overrides -> System prompt`.

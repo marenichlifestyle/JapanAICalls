@@ -62,7 +62,19 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
         return bool(user_id and user_id in settings.admin_ids)
 
     def can_access(user_id: int | None, chat_id: int | None, chat_type: str | None = None) -> bool:
-        return is_admin(user_id) and settings.is_allowed_telegram_chat(chat_id, chat_type)
+        if not is_admin(user_id):
+            logger.info(
+                "telegram access denied: non-admin user",
+                extra={"user_id": user_id, "chat_id": chat_id, "chat_type": chat_type},
+            )
+            return False
+        if not settings.is_allowed_telegram_chat(chat_id, chat_type):
+            logger.info(
+                "telegram access denied: chat is not allowlisted",
+                extra={"user_id": user_id, "chat_id": chat_id, "chat_type": chat_type},
+            )
+            return False
+        return True
 
     def can_access_message(message: Message) -> bool:
         return can_access(
