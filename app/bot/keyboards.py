@@ -45,7 +45,8 @@ def phone_review_keyboard(job_id: int, candidates_count: int) -> InlineKeyboardM
 
 def request_call_confirm_keyboard(campaign_id: int, count: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text=f"Запустить прозвон {count} номеров", callback_data=f"request:start:{campaign_id}")
+    kb.button(text=f"Автоматически прозвонить {count} номеров", callback_data=f"request:start:auto:{campaign_id}")
+    kb.button(text="С ручным продлением", callback_data=f"request:start:manual:{campaign_id}")
     kb.button(text="Изменить цель", callback_data=f"request:change_goal:{campaign_id}")
     kb.button(text="Отмена", callback_data=f"request:cancel:{campaign_id}")
     kb.adjust(1)

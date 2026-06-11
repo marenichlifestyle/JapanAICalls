@@ -430,7 +430,7 @@ async def test_request_campaign_generates_confirmation_and_goal_ru() -> None:
         assert "Call the sales department" in text
         assert "Ключевые вопросы:" in text
         assert "наличие/поставка" in text
-        assert "Запустить прозвон 1 номеров" in text
+        assert "Выберите режим запуска прозвона 1 номеров" in text
     await engine.dispose()
 
 
@@ -530,8 +530,14 @@ def test_settings_admin_ids_parse_new_allowed_users() -> None:
     settings = Settings(
         TELEGRAM_BOT_TOKEN="TEST_TOKEN",
         TELEGRAM_ADMIN_IDS="929466979,1560959066,90791472",
+        TELEGRAM_ALLOWED_CHAT_IDS="5288422605",
     )
     assert {929466979, 1560959066, 90791472}.issubset(settings.admin_ids)
+    assert settings.is_allowed_telegram_chat(123, "private")
+    assert settings.is_allowed_telegram_chat(5288422605, "group")
+    assert settings.is_allowed_telegram_chat(-5288422605, "group")
+    assert settings.is_allowed_telegram_chat(-1005288422605, "supergroup")
+    assert not settings.is_allowed_telegram_chat(-1001111111111, "supergroup")
 
 
 def test_request_target_report_html_is_escaped_and_compact() -> None:
@@ -645,6 +651,21 @@ async def test_latest_input_campaign_ignores_completed_and_waiting_next_states()
 
 
 @pytest.mark.asyncio
+async def test_request_campaign_accepts_supergroup_chat_id() -> None:
+    engine, session_maker = await _session_maker()
+    async with session_maker() as session:
+        campaign = await create_request_campaign(
+            session,
+            chat_id=-1005288422605,
+            user_id=929466979,
+            status="draft",
+        )
+        assert campaign.telegram_chat_id == -1005288422605
+        assert campaign.telegram_user_id == 929466979
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_request_campaign_uses_url_context_in_confirmation() -> None:
     engine, session_maker = await _session_maker()
     settings = _settings()
@@ -738,6 +759,57 @@ async def test_request_call_starts_one_call_with_goal_ru_only_and_waits_next() -
         assert "not_answered" not in report_text
         assert "VIN/stock" not in report_text
         assert "Оплата/документы" in report_text
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_call_auto_mode_starts_next_after_report_delivery() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    eleven = FakeEleven(settings)
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=eleven,
+    )
+    bot = FakeBot()
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text=(
+                "Duval Ford Jacksonville +1 (904) 387-6541\n"
+                "AutoNation Ford Jacksonville +1 (904) 513-3392\n"
+                "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки."
+            ),
+        )
+        campaign = await service.set_language_and_generate_goals(
+            session=session,
+            campaign=campaign,
+            call_language="en",
+        )
+        campaign.call_sequence_mode = "auto"
+        await session.commit()
+
+        first_job = await service.start_next_call(session=session, campaign=campaign, bot=bot)
+        assert first_job is not None
+        assert len(eleven.calls) == 1
+
+        await service.finalize_job_from_transcript(
+            session=session,
+            job=first_job,
+            bot=bot,
+            transcript="agent: hello\nuser: incoming unit is possible",
+            summary="completed",
+        )
+
+        targets = await service.list_targets(session, campaign.id)
+        assert targets[0].status == "completed"
+        assert targets[1].status == "waiting_call_result"
+        assert len(eleven.calls) == 2
+        assert not any("Прозвонить следующего" in str(row["kwargs"].get("reply_markup")) for row in bot.messages)
+        assert any("Автоматический режим" in row["text"] for row in bot.messages)
     await engine.dispose()
 
 
@@ -941,6 +1013,57 @@ async def test_request_report_delivery_failure_schedules_retry(monkeypatch) -> N
             summary="completed",
         )
         assert job.final_report_sent_at is None
+        assert job.final_report_error
+        assert job.next_notification_retry_at is not None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_call_auto_mode_does_not_start_next_when_report_delivery_fails(monkeypatch) -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    eleven = FakeEleven(settings)
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=eleven,
+    )
+
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text=(
+                "Duval Ford Jacksonville +1 (904) 387-6541\n"
+                "AutoNation Ford Jacksonville +1 (904) 513-3392\n"
+                "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки."
+            ),
+        )
+        campaign = await service.set_language_and_generate_goals(
+            session=session,
+            campaign=campaign,
+            call_language="en",
+        )
+        campaign.call_sequence_mode = "auto"
+        await session.commit()
+
+        job = await service.start_next_call(session=session, campaign=campaign, bot=FakeBot())
+        assert job is not None
+        assert len(eleven.calls) == 1
+
+        async def fail_send(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr("app.services.request_call.safe_send_message", fail_send)
+        await service.finalize_job_from_transcript(
+            session=session,
+            job=job,
+            bot=FakeBot(),
+            transcript="agent: hello\nuser: incoming unit is possible",
+            summary="completed",
+        )
+        assert len(eleven.calls) == 1
         assert job.final_report_error
         assert job.next_notification_retry_at is not None
     await engine.dispose()

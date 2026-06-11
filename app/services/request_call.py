@@ -56,6 +56,7 @@ VAGUE_GOALS = {
     "узнать по автомобилям",
 }
 READY_GOAL_STATUSES = {"ready", "ok", "success", "ready_to_confirm"}
+REQUEST_CALL_SEQUENCE_MODES = {"manual", "auto"}
 REQUEST_CALL_PROCESSING_MESSAGE = "Принято, формирую список дилеров, контекст авто и цель прозвона..."
 REQUEST_GOAL_MAX_WORDS = 100
 REQUEST_CONFIRMATION_QUESTION_LABELS = (
@@ -679,6 +680,7 @@ class RequestCallService:
             telegram_user_id=user_id,
             telegram_source_message_id=source_message_id,
             status="draft",
+            call_sequence_mode="manual",
             rejected_phones_json=[],
             telegram_service_message_ids=[],
         )
@@ -1427,14 +1429,23 @@ class RequestCallService:
         sent = await safe_send_message(bot, campaign.telegram_chat_id, report_html, parse_mode="HTML")
         success = bool(sent)
         if remaining and success:
-            prompt = await self.send_service_message(
-                session=session,
-                campaign=campaign,
-                bot=bot,
-                text="Выберите следующее действие:",
-                reply_markup=request_call_next_keyboard(campaign.id),
-            )
-            success = bool(prompt)
+            if (campaign.call_sequence_mode or "manual") == "auto":
+                await self.send_service_message(
+                    session=session,
+                    campaign=campaign,
+                    bot=bot,
+                    text="Автоматический режим: запускаю следующий звонок.",
+                )
+                await self.start_next_call(session=session, campaign=campaign, bot=bot)
+            else:
+                prompt = await self.send_service_message(
+                    session=session,
+                    campaign=campaign,
+                    bot=bot,
+                    text="Выберите следующее действие:",
+                    reply_markup=request_call_next_keyboard(campaign.id),
+                )
+                success = bool(prompt)
         elif not remaining:
             await self.cleanup_service_messages(session=session, campaign=campaign, bot=bot)
             summary_sent = await self.send_campaign_summary(session=session, campaign=campaign, bot=bot)
@@ -1477,7 +1488,7 @@ def build_request_confirmation_text(campaign: RequestCallCampaign, targets: list
         lines.extend(["", "Не смог распознать эти номера:"])
         for row in rejected:
             lines.append(f"- {row.get('original_line')}, причина: {row.get('reason')}")
-    lines.extend(["", f"Запустить прозвон {campaign.valid_numbers} номеров?"])
+    lines.extend(["", f"Выберите режим запуска прозвона {campaign.valid_numbers} номеров."])
     return "\n".join(lines)
 
 

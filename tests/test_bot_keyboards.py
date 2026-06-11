@@ -1,4 +1,10 @@
-from app.bot.keyboards import call_confirm_keyboard, call_language_keyboard, phone_review_keyboard, request_call_language_keyboard
+from app.bot.keyboards import (
+    call_confirm_keyboard,
+    call_language_keyboard,
+    phone_review_keyboard,
+    request_call_confirm_keyboard,
+    request_call_language_keyboard,
+)
 
 
 def _flatten_callbacks(markup) -> set[str]:
@@ -45,3 +51,12 @@ def test_request_call_language_keyboard_contains_en_and_ja_callbacks() -> None:
     assert callbacks == {"request:lang:en:55", "request:lang:ja:55"}
     labels = [btn.text for row in markup.inline_keyboard for btn in row]
     assert any("日本語" in label and "рекомендовано" in label for label in labels)
+
+
+def test_request_call_confirm_keyboard_contains_auto_and_manual_modes() -> None:
+    markup = request_call_confirm_keyboard(77, 5)
+    callbacks = _flatten_callbacks(markup)
+    assert "request:start:auto:77" in callbacks
+    assert "request:start:manual:77" in callbacks
+    assert "request:change_goal:77" in callbacks
+    assert "request:cancel:77" in callbacks

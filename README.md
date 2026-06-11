@@ -4,7 +4,7 @@ MVP Telegram-бота для прозвона `carsensor.net` и `cars.com` об
 
 ## Что реализовано (happy path)
 
-1. Telegram принимает сообщения только от `TELEGRAM_ADMIN_IDS`.
+1. Telegram принимает сообщения только от `TELEGRAM_ADMIN_IDS`; в группах дополнительно требуется `TELEGRAM_ALLOWED_CHAT_IDS`.
 2. На ссылку `carsensor.net/usedcar/detail/...` или `cars.com/vehicledetail/...` создаётся `job` и отправляются inline-кнопки `Прозвонить` / `Отмена`.
 3. После `Прозвонить`:
    - для `carsensor.net` бот запрашивает язык `Русский` / `Японский`,
@@ -82,6 +82,7 @@ cp .env.example .env
 Для режима `Прозвонить по запросу` задайте:
 - `ELEVENLABS_REQUEST_AGENT_ID` — English request-call агент.
 - `ELEVENLABS_REQUEST_AGENT_ID_JA` — Japanese request-call агент.
+Для работы в Telegram-группах задайте `TELEGRAM_ALLOWED_CHAT_IDS` и добавьте бота администратором в чат. Если бот не видит обычные сообщения в группе, отключите privacy mode через BotFather.
 Рекомендуемый режим для production: не отправлять `prompt` override из кода, а задавать prompt и first message в ElevenLabs dashboard с переменными `{{car_spoken_ru}}`, `{{price_used_spoken_ru}}`.
 Если всё же хотите override prompt из кода, в ElevenLabs нужно включить:
 `Agent -> Security -> Overrides -> System prompt`.
@@ -237,6 +238,10 @@ curl https://your-ngrok-url.ngrok-free.app/health
 ```
 
 Значение `goal_ru` будет на английском или японском языке в зависимости от выбранного языка звонка.
+
+Перед запуском request-call кампании бот предлагает режим:
+- `Автоматически` — прозванивает все pending номера подряд, но только после успешной отправки отчёта по предыдущему звонку.
+- `С ручным продлением` — текущая пошаговая логика: после каждого отчёта нужно нажать `Прозвонить следующего`.
 
 ## Retry/Queue Settings
 

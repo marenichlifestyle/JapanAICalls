@@ -61,6 +61,25 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
     def is_admin(user_id: int | None) -> bool:
         return bool(user_id and user_id in settings.admin_ids)
 
+    def can_access(user_id: int | None, chat_id: int | None, chat_type: str | None = None) -> bool:
+        return is_admin(user_id) and settings.is_allowed_telegram_chat(chat_id, chat_type)
+
+    def can_access_message(message: Message) -> bool:
+        return can_access(
+            message.from_user.id if message.from_user else None,
+            message.chat.id,
+            message.chat.type,
+        )
+
+    def can_access_callback(callback: CallbackQuery) -> bool:
+        if callback.message:
+            return can_access(
+                callback.from_user.id if callback.from_user else None,
+                callback.message.chat.id,
+                callback.message.chat.type,
+            )
+        return is_admin(callback.from_user.id if callback.from_user else None)
+
     async def send_start_menu(message: Message) -> None:
         await message.answer("Выберите режим прозвона:", reply_markup=start_mode_keyboard())
 
@@ -72,15 +91,21 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 callback.message.message_id,
             )
 
+    async def ensure_request_campaign_owner(callback: CallbackQuery, campaign) -> bool:
+        if campaign.telegram_user_id == callback.from_user.id:
+            return True
+        await callback.answer("Эту кампанию начал другой админ", show_alert=True)
+        return False
+
     @router.message(Command("start"))
     async def start(message: Message) -> None:
-        if not is_admin(message.from_user.id if message.from_user else None):
+        if not can_access_message(message):
             return
         await send_start_menu(message)
 
     @router.callback_query(F.data == "mode:link")
     async def select_link_mode(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         await callback.answer()
@@ -90,7 +115,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data == "mode:request")
     async def select_request_mode(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         async with SessionLocal() as session:
@@ -124,7 +149,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.message(F.text)
     async def handle_text(message: Message) -> None:
-        if not is_admin(message.from_user.id if message.from_user else None):
+        if not can_access_message(message):
             return
 
         text = message.text or ""
@@ -237,7 +262,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("cancel:"))
     async def cancel_call(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
 
@@ -260,7 +285,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("call:"))
     async def start_call(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
 
@@ -282,7 +307,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("lang:"))
     async def start_call_with_language(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
 
@@ -330,7 +355,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("phone_review:approve:"))
     async def approve_phone_review(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         try:
@@ -368,7 +393,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("phone_review:reject:"))
     async def reject_phone_review(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         try:
@@ -399,26 +424,49 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("request:start:"))
     async def request_start_calls(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
-        campaign_id = int(callback.data.split(":", 2)[2])
+        try:
+            parts = callback.data.split(":")
+            if len(parts) == 3:
+                sequence_mode = "manual"
+                campaign_id = int(parts[2])
+            elif len(parts) == 4 and parts[2] in {"auto", "manual"}:
+                sequence_mode = parts[2]
+                campaign_id = int(parts[3])
+            else:
+                raise ValueError("invalid request start callback")
+        except Exception:
+            await callback.answer("Некорректные данные", show_alert=True)
+            return
         async with SessionLocal() as session:
             campaign = await get_request_campaign(session, campaign_id)
             if not campaign:
                 await callback.answer("Кампания не найдена", show_alert=True)
                 return
+            if not await ensure_request_campaign_owner(callback, campaign):
+                return
             if campaign.status not in REQUEST_START_STATUSES:
                 await callback.answer(f"Кампания в статусе {campaign.status}")
                 return
+            campaign.call_sequence_mode = sequence_mode
+            await session.commit()
             if callback.message:
                 await callback.message.edit_reply_markup(reply_markup=None)
             await callback.answer("Запускаю первый звонок")
+            if sequence_mode == "auto":
+                await request_service.send_service_message(
+                    session=session,
+                    campaign=campaign,
+                    bot=callback.bot,
+                    text="Автоматический режим включён: буду прозванивать номера подряд.",
+                )
             await request_service.start_next_call(session=session, campaign=campaign, bot=callback.bot)
 
     @router.callback_query(F.data.startswith("request:lang:"))
     async def request_select_language(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         try:
@@ -433,6 +481,8 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
             campaign = await get_request_campaign(session, campaign_id)
             if not campaign:
                 await callback.answer("Кампания не найдена", show_alert=True)
+                return
+            if not await ensure_request_campaign_owner(callback, campaign):
                 return
             if campaign.status not in {"needs_language", "ready_to_confirm"}:
                 await callback.answer(f"Кампания в статусе {campaign.status}")
@@ -476,7 +526,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("request:next:"))
     async def request_next_call(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         campaign_id = int(callback.data.split(":", 2)[2])
@@ -484,6 +534,8 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
             campaign = await get_request_campaign(session, campaign_id)
             if not campaign:
                 await callback.answer("Кампания не найдена", show_alert=True)
+                return
+            if not await ensure_request_campaign_owner(callback, campaign):
                 return
             if campaign.status in {"completed", "stopped", "canceled"}:
                 await callback.answer("Кампания уже завершена")
@@ -500,7 +552,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("request:stop:"))
     async def request_stop_campaign(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         campaign_id = int(callback.data.split(":", 2)[2])
@@ -508,6 +560,8 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
             campaign = await get_request_campaign(session, campaign_id)
             if not campaign:
                 await callback.answer("Кампания не найдена", show_alert=True)
+                return
+            if not await ensure_request_campaign_owner(callback, campaign):
                 return
             campaign.status = "stopped"
             await session.commit()
@@ -518,7 +572,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("request:change_goal:"))
     async def request_change_goal(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         campaign_id = int(callback.data.split(":", 2)[2])
@@ -526,6 +580,8 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
             campaign = await get_request_campaign(session, campaign_id)
             if not campaign:
                 await callback.answer("Кампания не найдена", show_alert=True)
+                return
+            if not await ensure_request_campaign_owner(callback, campaign):
                 return
             campaign.status = "needs_goal"
             await session.commit()
@@ -536,13 +592,15 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
 
     @router.callback_query(F.data.startswith("request:cancel:"))
     async def request_cancel_campaign(callback: CallbackQuery) -> None:
-        if not is_admin(callback.from_user.id if callback.from_user else None):
+        if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
         campaign_id = int(callback.data.split(":", 2)[2])
         async with SessionLocal() as session:
             campaign = await get_request_campaign(session, campaign_id)
             if campaign:
+                if not await ensure_request_campaign_owner(callback, campaign):
+                    return
                 campaign.status = "stopped"
                 await session.commit()
                 await request_service.cleanup_service_messages(session=session, campaign=campaign, bot=callback.bot)

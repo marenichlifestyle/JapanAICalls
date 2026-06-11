@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -15,8 +15,8 @@ class Job(Base):
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_chat_id: Mapped[int] = mapped_column(Integer, index=True)
-    telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    telegram_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     telegram_source_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     telegram_service_message_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
     call_language: Mapped[str | None] = mapped_column(String(8), nullable=True)
@@ -210,8 +210,8 @@ class RequestCallCampaign(Base):
     __tablename__ = "request_call_campaigns"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_chat_id: Mapped[int] = mapped_column(Integer, index=True)
-    telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    telegram_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     telegram_source_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     telegram_service_message_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
     mode: Mapped[str] = mapped_column(String(32), default="request_call")
@@ -219,6 +219,7 @@ class RequestCallCampaign(Base):
     raw_user_goal: Mapped[str | None] = mapped_column(Text, nullable=True)
     normalized_goal_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     call_language: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    call_sequence_mode: Mapped[str] = mapped_column(String(16), default="manual")
     phone_region: Mapped[str | None] = mapped_column(String(8), nullable=True)
     source_urls_json: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     vehicle_context_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)

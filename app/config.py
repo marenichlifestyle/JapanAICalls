@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = Field(default="TEST_TOKEN", alias="TELEGRAM_BOT_TOKEN")
     telegram_admin_ids: str = Field(default="1", alias="TELEGRAM_ADMIN_IDS")
+    telegram_allowed_chat_ids: str = Field(default="", alias="TELEGRAM_ALLOWED_CHAT_IDS")
     telegram_webhook_enabled: bool = Field(default=False, alias="TELEGRAM_WEBHOOK_ENABLED")
     telegram_webhook_path: str = Field(default="/webhooks/telegram", alias="TELEGRAM_WEBHOOK_PATH")
 
@@ -92,6 +93,34 @@ class Settings(BaseSettings):
     def admin_ids(self) -> set[int]:
         raw = self.telegram_admin_ids.replace(" ", "")
         return {int(x) for x in raw.split(",") if x}
+
+    @property
+    def allowed_chat_ids(self) -> set[int]:
+        raw = self.telegram_allowed_chat_ids.replace(" ", "")
+        return {int(x) for x in raw.split(",") if x}
+
+    @staticmethod
+    def telegram_chat_id_aliases(chat_id: int | None) -> set[int]:
+        if chat_id is None:
+            return set()
+        raw = int(chat_id)
+        abs_raw = abs(raw)
+        aliases = {raw, abs_raw, -abs_raw}
+        digits = str(abs_raw)
+        if digits.startswith("100") and len(digits) > 3:
+            bare = int(digits[3:])
+            aliases.update({bare, -bare, int(f"-100{bare}")})
+        else:
+            aliases.add(int(f"-100{digits}"))
+        return aliases
+
+    def is_allowed_telegram_chat(self, chat_id: int | None, chat_type: str | None = None) -> bool:
+        if chat_type == "private":
+            return True
+        allowed_aliases: set[int] = set()
+        for allowed_id in self.allowed_chat_ids:
+            allowed_aliases.update(self.telegram_chat_id_aliases(allowed_id))
+        return bool(allowed_aliases and not self.telegram_chat_id_aliases(chat_id).isdisjoint(allowed_aliases))
 
     @property
     def normalized_webhook_base_url(self) -> str:
