@@ -1,4 +1,4 @@
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import ForceReply, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -16,6 +16,13 @@ def start_mode_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="Прозвонить по запросу", callback_data="mode:request")
     kb.adjust(1)
     return kb.as_markup()
+
+
+def request_call_input_force_reply() -> ForceReply:
+    return ForceReply(
+        selective=True,
+        input_field_placeholder="Список дилеров, телефоны и задача",
+    )
 
 
 def call_language_keyboard(job_id: int, source: str | None = None) -> InlineKeyboardMarkup:

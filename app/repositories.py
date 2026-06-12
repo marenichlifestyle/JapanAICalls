@@ -262,6 +262,7 @@ REQUEST_CAMPAIGN_INPUT_STATUSES = {
     "draft",
     "needs_phones",
     "needs_goal",
+    "needs_phones_and_goal",
     "needs_goal_clarification",
     "needs_language",
     "mixed_phone_regions",
@@ -354,6 +355,24 @@ async def get_latest_input_request_campaign(
     if campaign and campaign.status in REQUEST_CAMPAIGN_INPUT_STATUSES:
         return campaign
     return None
+
+
+async def get_latest_input_request_campaign_in_chat(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+) -> RequestCallCampaign | None:
+    stmt = (
+        select(RequestCallCampaign)
+        .where(
+            RequestCallCampaign.telegram_chat_id == chat_id,
+            RequestCallCampaign.status.in_(REQUEST_CAMPAIGN_INPUT_STATUSES),
+        )
+        .order_by(RequestCallCampaign.id.desc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 async def list_request_targets(session: AsyncSession, campaign_id: int) -> list[DealerCallTarget]:

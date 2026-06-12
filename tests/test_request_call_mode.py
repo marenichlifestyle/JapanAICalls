@@ -8,7 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.config import Settings
 from app.models import Base, CallReport, Job
-from app.repositories import create_request_campaign, get_latest_input_request_campaign
+from app.repositories import (
+    create_request_campaign,
+    get_latest_input_request_campaign,
+    get_latest_input_request_campaign_in_chat,
+)
 from app.schemas import GoalGenerationResult, RequestCallReportResult
 from app.services.elevenlabs_client import ElevenLabsService
 from app.services.openai_client import OpenAIService
@@ -317,6 +321,27 @@ def test_parse_request_call_input_missing_data_statuses_and_invalid_phone() -> N
     assert invalid.rejected_phones[0].reason == "invalid_phone"
 
     assert is_goal_too_vague("узнать по машинам")
+
+
+def test_parse_request_call_input_accepts_bare_us_ten_digit_numbers() -> None:
+    parsed = parse_request_call_input(
+        """
+        5138125916
+        6149141032
+        4694608742
+
+        Не RAM и не Ford
+
+        Нужно уточнить по наличию Lexus LC новый, кабриолет, наценку и покупку на компанию.
+        """
+    )
+    assert parsed.status == "ready_to_confirm"
+    assert [dealer.phone_e164 for dealer in parsed.dealers] == [
+        "+15138125916",
+        "+16149141032",
+        "+14694608742",
+    ]
+    assert "Lexus LC" in parsed.raw_user_goal
 
 
 def test_ram_trx_goal_is_not_treated_as_vague() -> None:
@@ -658,6 +683,22 @@ async def test_latest_input_campaign_ignores_completed_and_waiting_next_states()
 
         fresh = await create_request_campaign(session, chat_id=10, user_id=1, status="draft")
         assert (await get_latest_input_request_campaign(session, chat_id=10, user_id=1)).id == fresh.id
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_latest_input_campaign_can_be_found_by_group_chat() -> None:
+    engine, session_maker = await _session_maker()
+    async with session_maker() as session:
+        await create_request_campaign(session, chat_id=-1005288422605, user_id=1, status="completed")
+        draft = await create_request_campaign(session, chat_id=-1005288422605, user_id=1, status="draft")
+
+        assert await get_latest_input_request_campaign(session, chat_id=-1005288422605, user_id=2) is None
+        assert (await get_latest_input_request_campaign_in_chat(session, chat_id=-1005288422605)).id == draft.id
+
+        draft.status = "needs_phones_and_goal"
+        await session.commit()
+        assert (await get_latest_input_request_campaign_in_chat(session, chat_id=-1005288422605)).id == draft.id
     await engine.dispose()
 
 

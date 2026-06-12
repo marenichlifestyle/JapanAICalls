@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, Message
 from app.bot.keyboards import (
     call_confirm_keyboard,
     call_language_keyboard,
+    request_call_input_force_reply,
     request_call_confirm_keyboard,
     request_call_language_keyboard,
     start_mode_keyboard,
@@ -22,6 +23,7 @@ from app.repositories import (
     find_duplicate_listing_job,
     get_job,
     get_latest_input_request_campaign,
+    get_latest_input_request_campaign_in_chat,
     get_request_campaign,
 )
 from app.services.elevenlabs_client import ElevenLabsService
@@ -38,6 +40,13 @@ logger = logging.getLogger(__name__)
 CARSENSOR_URL_RE = re.compile(r"https?://(?:www\.)?carsensor\.net/usedcar/detail/[\w\-/?=&%\.]+")
 CARS_COM_URL_RE = re.compile(r"https?://(?:www\.)?cars\.com/vehicledetail/[\w\-/?=&%\.]+")
 REQUEST_START_STATUSES = {"ready_to_confirm", "ready_to_call"}
+GROUP_TEXT_ADOPTABLE_CAMPAIGN_STATUSES = {
+    "draft",
+    "needs_phones",
+    "needs_goal",
+    "needs_phones_and_goal",
+    "needs_goal_clarification",
+}
 
 
 def detect_source(url: str) -> str:
@@ -157,6 +166,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                         "покупка без кредита и лизинга, оплата переводом.\n\n"
                         "После разбора я спрошу язык звонка: English или 日本語."
                     ),
+                    reply_markup=request_call_input_force_reply(),
                 )
 
     @router.message(F.text)
@@ -171,6 +181,26 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 chat_id=message.chat.id,
                 user_id=message.from_user.id,
             )
+            if campaign is None and message.chat.type in {"group", "supergroup"}:
+                campaign = await get_latest_input_request_campaign_in_chat(
+                    session,
+                    chat_id=message.chat.id,
+                )
+                if campaign and campaign.status not in GROUP_TEXT_ADOPTABLE_CAMPAIGN_STATUSES:
+                    campaign = None
+                elif campaign and campaign.telegram_user_id != message.from_user.id:
+                    logger.info(
+                        "request-call group input campaign adopted by admin",
+                        extra={
+                            "campaign_id": campaign.id,
+                            "chat_id": message.chat.id,
+                            "previous_user_id": campaign.telegram_user_id,
+                            "new_user_id": message.from_user.id,
+                            "status": campaign.status,
+                        },
+                    )
+                    campaign.telegram_user_id = message.from_user.id
+                    await session.commit()
             if campaign:
                 processing_message = await message.answer(REQUEST_CALL_PROCESSING_MESSAGE)
                 try:
@@ -194,6 +224,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Цель понял, но не нашёл номера телефонов. Пришлите список дилеров с телефонами.",
+                            reply_markup=request_call_input_force_reply(),
                         )
                     elif campaign.status == "needs_goal":
                         await request_service.send_service_message(
@@ -201,6 +232,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Номера нашёл. Теперь пришлите задачу прозвона: что именно нужно выяснить у дилеров?",
+                            reply_markup=request_call_input_force_reply(),
                         )
                     elif campaign.status == "needs_phones_and_goal":
                         await request_service.send_service_message(
@@ -208,6 +240,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Пришлите список дилеров с телефонами и задачу прозвона одним сообщением.",
+                            reply_markup=request_call_input_force_reply(),
                         )
                     elif campaign.status == "needs_goal_clarification":
                         await request_service.send_service_message(
@@ -215,6 +248,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Уточните, пожалуйста, какую модель или задачу прозванивать и что обязательно выяснить?",
+                            reply_markup=request_call_input_force_reply(),
                         )
                     elif campaign.status == "needs_language":
                         recommended = "ja" if campaign.phone_region == "JP" else "en"
