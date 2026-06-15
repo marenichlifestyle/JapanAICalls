@@ -619,12 +619,13 @@ class RequestCallService:
         chat_id: int,
         user_id: int,
         source_message_id: int | None = None,
+        status: str = "draft",
     ) -> RequestCallCampaign:
         campaign = RequestCallCampaign(
             telegram_chat_id=chat_id,
             telegram_user_id=user_id,
             telegram_source_message_id=source_message_id,
-            status="draft",
+            status=status,
             call_sequence_mode="manual",
             rejected_phones_json=[],
             telegram_service_message_ids=[],

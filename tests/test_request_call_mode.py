@@ -364,6 +364,26 @@ def test_parse_request_call_input_accepts_bare_us_ten_digit_numbers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_draft_accepts_initial_status_for_country_flow() -> None:
+    engine, session_maker = await _session_maker()
+    service = RequestCallService(
+        settings=_settings(),
+        openai_service=FakeOpenAI(_settings()),
+        elevenlabs_service=FakeEleven(_settings()),
+    )
+    async with session_maker() as session:
+        campaign = await service.create_draft(
+            session=session,
+            chat_id=10,
+            user_id=1,
+            status="needs_country",
+        )
+        assert campaign.status == "needs_country"
+        assert campaign.call_sequence_mode == "manual"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_request_campaign_requires_country_before_parsing_text() -> None:
     engine, session_maker = await _session_maker()
     service = RequestCallService(
