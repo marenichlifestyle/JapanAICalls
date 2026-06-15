@@ -81,31 +81,6 @@ EMPTY_REPORT_VALUES = {
     "не получено",
     "не выяснили",
 }
-DEALER_BRAND_LABELS = (
-    ("ram", "a RAM dealership"),
-    ("dodge", "a RAM dealership"),
-    ("chrysler", "a RAM dealership"),
-    ("ford", "a Ford dealership"),
-    ("форд", "a Ford dealership"),
-    ("toyota", "a Toyota dealership"),
-    ("lexus", "a Lexus dealership"),
-    ("bmw", "a BMW dealership"),
-    ("mercedes", "a Mercedes-Benz dealership"),
-    ("mercedes-benz", "a Mercedes-Benz dealership"),
-    ("chevrolet", "a Chevrolet dealership"),
-    ("chevy", "a Chevrolet dealership"),
-    ("tesla", "a Tesla dealership"),
-    ("porsche", "a Porsche dealership"),
-    ("honda", "a Honda dealership"),
-    ("nissan", "a Nissan dealership"),
-    ("audi", "an Audi dealership"),
-    ("jeep", "a Jeep dealership"),
-    ("gmc", "a GMC dealership"),
-    ("cadillac", "a Cadillac dealership"),
-    ("hyundai", "a Hyundai dealership"),
-    ("kia", "a Kia dealership"),
-)
-
 REQUEST_CALL_FINALIZATION_LOCK_CLASS_ID = 62041
 
 
@@ -138,7 +113,7 @@ class ParsedRequestInput:
 
     @property
     def has_mixed_phone_regions(self) -> bool:
-        return False
+        return len(self.phone_regions) > 1
 
     @property
     def status(self) -> str:
@@ -187,10 +162,17 @@ def _normalize_allowed_phone(raw: str, default_region: str) -> tuple[str | None,
     return (e164, region[:8]) if e164 else (None, None)
 
 
-def _find_allowed_phone_matches(line: str) -> list[tuple[int, int, str, str, str]]:
+def _phone_match_regions(default_region: str | None = None) -> tuple[str, ...]:
+    normalized = (default_region or "").upper()
+    if normalized in PHONE_MATCH_REGIONS:
+        return (normalized, *(region for region in PHONE_MATCH_REGIONS if region != normalized))
+    return PHONE_MATCH_REGIONS
+
+
+def _find_allowed_phone_matches(line: str, default_region: str | None = None) -> list[tuple[int, int, str, str, str]]:
     matches: list[tuple[int, int, str, str, str]] = []
     seen_spans: set[tuple[int, int]] = set()
-    for region in PHONE_MATCH_REGIONS:
+    for region in _phone_match_regions(default_region):
         for match in phonenumbers.PhoneNumberMatcher(line, region):
             span = (match.start, match.end)
             if span in seen_spans:
@@ -413,9 +395,10 @@ def _dedupe_duplicate_city(dealer_text: str, city: str | None) -> str:
     return dealer_text
 
 
-def parse_request_call_input(text: str) -> ParsedRequestInput:
+def parse_request_call_input(text: str, *, default_region: str | None = None) -> ParsedRequestInput:
     result = ParsedRequestInput()
     goal_lines: list[str] = []
+    default_region = (default_region or "").upper() or None
 
     for raw_line in (text or "").splitlines():
         line = _clean_spaces(raw_line)
@@ -428,7 +411,15 @@ def parse_request_call_input(text: str) -> ParsedRequestInput:
         if not line:
             continue
 
-        matches = _find_allowed_phone_matches(line)
+        matches = _find_allowed_phone_matches(line, default_region=default_region)
+        if default_region in {"US", "JP"} and matches:
+            country_matches = [match for match in matches if match[4] == default_region]
+            if not country_matches:
+                result.rejected_phones.append(
+                    RejectedPhone(original_line=line, reason=f"wrong_country_expected_{default_region.lower()}")
+                )
+                continue
+            matches = country_matches
         if matches:
             start, end, phone_raw, phone_e164, phone_region = matches[-1]
             dealer_text = _clean_spaces(line[:start] + " " + line[end:])
@@ -496,60 +487,12 @@ def _constraint_parts(raw_user_goal: str) -> tuple[list[str], list[str]]:
     return constraints, constraint_phrases
 
 
-def _dealer_goal_label(*values: str | None, call_language: str = "en") -> str:
-    source = " ".join(value or "" for value in values).lower()
-    if call_language == "ja":
-        ja_labels = (
-            ("ford", "フォード販売店"),
-            ("フォード", "フォード販売店"),
-            ("toyota", "トヨタ販売店"),
-            ("トヨタ", "トヨタ販売店"),
-            ("bmw", "BMW販売店"),
-            ("mercedes", "メルセデス・ベンツ販売店"),
-            ("メルセデス", "メルセデス・ベンツ販売店"),
-            ("honda", "ホンダ販売店"),
-            ("ホンダ", "ホンダ販売店"),
-            ("nissan", "日産販売店"),
-            ("日産", "日産販売店"),
-        )
-        for marker, label in ja_labels:
-            if marker in source:
-                return label
-        return "販売店"
-    for marker, label in DEALER_BRAND_LABELS:
-        if marker in source:
-            return label
-    return "the dealership"
-
-
 def _contains_dealer_label(goal_text: str | None) -> bool:
     normalized = (goal_text or "").lower().replace("’", "'")
     if not normalized:
         return False
-    english_labels = {label.lower().replace("’", "'") for _, label in DEALER_BRAND_LABELS}
-    english_labels.update(
-        {
-            "a dodge dealership",
-            "a jeep dealership",
-            "a ram dealership",
-            "a ram dealership's",
-            "a ram dealership’s",
-            "a jeep dealership's",
-            "a jeep dealership’s",
-        }
-    )
-    japanese_labels = {
-        "フォード販売店",
-        "トヨタ販売店",
-        "レクサス販売店",
-        "bmw販売店",
-        "メルセデス・ベンツ販売店",
-        "ホンダ販売店",
-        "日産販売店",
-        "ポルシェ販売店",
-        "販売店の販売部門",
-    }
-    return any(label in normalized for label in english_labels) or any(label in (goal_text or "") for label in japanese_labels)
+    has_brand_dealership = bool(re.search(r"\ba[n]?\s+[a-z0-9][a-z0-9&'\- ]{1,40}\s+dealership(?:'s)?\b", normalized))
+    return has_brand_dealership or "販売店" in (goal_text or "")
 
 
 def _compact_goal_text(
@@ -748,9 +691,17 @@ class RequestCallService:
         text: str,
         source_message_id: int | None = None,
     ) -> RequestCallCampaign:
-        parsed = parse_request_call_input(text)
+        selected_region = (campaign.phone_region or "").upper()
+        if selected_region not in {"US", "JP"}:
+            campaign.status = "needs_country"
+            campaign.telegram_source_message_id = source_message_id or campaign.telegram_source_message_id
+            campaign.raw_input = "\n".join(part for part in (campaign.raw_input, text) if part).strip()
+            await session.commit()
+            await session.refresh(campaign)
+            return campaign
+
+        parsed = parse_request_call_input(text, default_region=selected_region)
         campaign.telegram_source_message_id = source_message_id or campaign.telegram_source_message_id
-        previous_region = campaign.phone_region
 
         # Follow-up messages are incremental: a user may first send phones, then a
         # goal, or clarify the goal after LLM validation. Keep the existing side
@@ -767,10 +718,13 @@ class RequestCallService:
         campaign.rejected_phones_json = [row.__dict__ for row in parsed.rejected_phones]
         await self._add_targets_from_vehicle_context_if_needed(session, campaign)
         await self._refresh_counts(session, campaign)
-        if parsed.dealers and previous_region and campaign.phone_region and campaign.phone_region != previous_region:
-            campaign.call_language = None
+        has_wrong_country_phone = any(
+            str(row.reason).startswith("wrong_country_expected_") for row in parsed.rejected_phones
+        )
 
-        if not campaign.valid_numbers and not (campaign.raw_user_goal or "").strip():
+        if parsed.has_mixed_phone_regions or has_wrong_country_phone:
+            campaign.status = "mixed_phone_regions"
+        elif not campaign.valid_numbers and not (campaign.raw_user_goal or "").strip():
             campaign.status = "needs_phones_and_goal"
         elif not campaign.valid_numbers:
             campaign.status = "needs_phones"
@@ -779,7 +733,8 @@ class RequestCallService:
         elif is_goal_too_vague(campaign.raw_user_goal or ""):
             campaign.status = "needs_goal_clarification"
         elif not campaign.call_language:
-            campaign.status = "needs_language"
+            campaign.call_language = "ja" if selected_region == "JP" else "en"
+            await self._generate_target_goals(session, campaign)
         else:
             await self._generate_target_goals(session, campaign)
 
@@ -816,23 +771,19 @@ class RequestCallService:
     ) -> None:
         if (await self.list_targets(session, campaign.id)):
             return
+        selected_region = (campaign.phone_region or "").upper()
         contexts = campaign.vehicle_context_json or []
         for context in contexts:
             raw_phone = context.get("dealer_phone")
             source_url = context.get("source_url") or ""
-            if raw_phone and ("carsensor.net" in source_url.lower() or ".jp" in source_url.lower()):
+            if selected_region == "JP":
                 if is_special_or_proxy_phone(raw_phone):
                     continue
                 phone_e164, phone_region = _normalize_allowed_phone(raw_phone, "JP")
             else:
-                phone_e164 = None
-                phone_region = None
-                for region in PHONE_MATCH_REGIONS:
-                    phone_e164, phone_region = _normalize_allowed_phone(raw_phone or "", region)
-                    if phone_e164 and phone_region:
-                        break
+                phone_e164, phone_region = _normalize_allowed_phone(raw_phone or "", selected_region or "US")
             phone_region = phone_region or self._region_from_e164(phone_e164)
-            if not phone_e164 or not phone_region:
+            if not phone_e164 or not phone_region or (selected_region in {"US", "JP"} and phone_region != selected_region):
                 continue
             dealer_name = _clean_spaces(context.get("dealer_name") or "Dealer from URL")
             session.add(
@@ -879,7 +830,8 @@ class RequestCallService:
         campaign.invalid_numbers = len(rejected)
         campaign.total_numbers = campaign.valid_numbers + campaign.invalid_numbers
         regions = {target.phone_region for target in targets if target.phone_region}
-        campaign.phone_region = next(iter(regions)) if len(regions) == 1 else None
+        if regions:
+            campaign.phone_region = next(iter(regions)) if len(regions) == 1 else None
 
     async def _generate_target_goals(self, session: AsyncSession, campaign: RequestCallCampaign) -> None:
         targets = await self.list_targets(session, campaign.id)
@@ -918,6 +870,8 @@ class RequestCallService:
         call_language: str,
     ) -> RequestCallCampaign:
         campaign.call_language = "ja" if call_language == "ja" else "en"
+        if not campaign.phone_region:
+            campaign.phone_region = "JP" if campaign.call_language == "ja" else "US"
         if not campaign.valid_numbers:
             campaign.status = "needs_phones"
         elif not (campaign.raw_user_goal or "").strip():

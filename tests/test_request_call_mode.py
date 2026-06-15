@@ -254,6 +254,15 @@ async def _session_maker():
     return engine, session_maker
 
 
+async def _select_request_country(session: AsyncSession, campaign, region: str = "US"):
+    campaign.phone_region = region
+    campaign.call_language = "ja" if region == "JP" else "en"
+    campaign.status = "draft"
+    await session.commit()
+    await session.refresh(campaign)
+    return campaign
+
+
 def test_parse_request_call_input_splits_dealers_goal_and_headers() -> None:
     parsed = parse_request_call_input(
         """
@@ -283,7 +292,8 @@ def test_parse_request_call_input_supports_jp_phones_urls_and_mixed_regions() ->
     parsed = parse_request_call_input(
         "東京BMW 03-1234-5678\n"
         "https://example.jp/car/123\n"
-        "Задача: уточнить BMW M3 в наличии."
+        "Задача: уточнить BMW M3 в наличии.",
+        default_region="JP",
     )
     assert parsed.dealers[0].phone_e164 == "+81312345678"
     assert parsed.dealers[0].phone_region == "JP"
@@ -293,10 +303,18 @@ def test_parse_request_call_input_supports_jp_phones_urls_and_mixed_regions() ->
     mixed = parse_request_call_input(
         "Duval Ford +1 (904) 387-6541\n"
         "東京BMW 03-1234-5678\n"
-        "Задача: уточнить наличие."
+        "Задача: уточнить наличие.",
     )
     assert mixed.status == "ready_to_confirm"
+    assert mixed.has_mixed_phone_regions
     assert [dealer.phone_region for dealer in mixed.dealers] == ["US", "JP"]
+
+    us_selected_with_jp_number = parse_request_call_input(
+        "東京BMW 03-1234-5678\nЗадача: уточнить наличие.",
+        default_region="US",
+    )
+    assert us_selected_with_jp_number.status == "needs_phones"
+    assert us_selected_with_jp_number.rejected_phones[0].reason == "wrong_country_expected_us"
 
     ru = parse_request_call_input("+79385170519\nСпросить про тойоту камри")
     assert ru.status == "ready_to_confirm"
@@ -333,7 +351,8 @@ def test_parse_request_call_input_accepts_bare_us_ten_digit_numbers() -> None:
         Не RAM и не Ford
 
         Нужно уточнить по наличию Lexus LC новый, кабриолет, наценку и покупку на компанию.
-        """
+        """,
+        default_region="US",
     )
     assert parsed.status == "ready_to_confirm"
     assert [dealer.phone_e164 for dealer in parsed.dealers] == [
@@ -342,6 +361,70 @@ def test_parse_request_call_input_accepts_bare_us_ten_digit_numbers() -> None:
         "+14694608742",
     ]
     assert "Lexus LC" in parsed.raw_user_goal
+
+
+@pytest.mark.asyncio
+async def test_request_campaign_requires_country_before_parsing_text() -> None:
+    engine, session_maker = await _session_maker()
+    service = RequestCallService(
+        settings=_settings(),
+        openai_service=FakeOpenAI(_settings()),
+        elevenlabs_service=FakeEleven(_settings()),
+    )
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign.status = "needs_country"
+        await session.commit()
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="5138125916\nЗадача: уточнить Lexus LC",
+        )
+        targets = await service.list_targets(session, campaign.id)
+        assert campaign.status == "needs_country"
+        assert campaign.raw_input
+        assert targets == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_campaign_blocks_numbers_from_wrong_selected_country() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="東京BMW 03-1234-5678\nЗадача: уточнить наличие Lexus LC.",
+        )
+        assert campaign.status == "mixed_phone_regions"
+        assert campaign.valid_numbers == 0
+        assert campaign.rejected_phones_json[0]["reason"] == "wrong_country_expected_us"
+    await engine.dispose()
+
+
+def test_parse_request_call_input_uses_selected_jp_region_for_national_numbers() -> None:
+    parsed = parse_request_call_input(
+        "東京トヨタ 03-1234-5678\nLexus LCの在庫を確認したい。",
+        default_region="JP",
+    )
+    assert parsed.status == "ready_to_confirm"
+    assert parsed.dealers[0].phone_e164 == "+81312345678"
+    assert parsed.dealers[0].phone_region == "JP"
+
+    rejected_proxy = parse_request_call_input(
+        "東京トヨタ 0078-6002-648302\nLexus LCの在庫を確認したい。",
+        default_region="JP",
+    )
+    assert rejected_proxy.status == "needs_phones"
+    assert rejected_proxy.rejected_phones[0].reason == "invalid_phone"
 
 
 def test_ram_trx_goal_is_not_treated_as_vague() -> None:
@@ -396,10 +479,13 @@ async def test_goal_generation_prompt_requires_follow_up_questions() -> None:
     assert "never more than 110 words" in openai.last_prompt
     assert "never copy or mention the exact dealer_name" in openai.last_prompt
     assert "do not use brand-specific dealer labels" in openai.last_prompt
+    assert "a <brand> dealership" in openai.last_prompt
     assert "Call the sales department about" in openai.last_prompt
     assert "availability or incoming ETA" in openai.last_prompt
     assert "keep the call natural" in openai.last_prompt
     assert "Do not end the call" not in openai.last_prompt
+    assert "a Ford dealership" not in openai.last_prompt
+    assert "a Jeep dealership" not in openai.last_prompt
 
 
 @pytest.mark.asyncio
@@ -429,6 +515,7 @@ async def test_request_campaign_generates_confirmation_and_goal_ru() -> None:
     )
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -439,7 +526,7 @@ async def test_request_campaign_generates_confirmation_and_goal_ru() -> None:
             ),
         )
         targets = await service.list_targets(session, campaign.id)
-        assert campaign.status == "needs_language"
+        assert campaign.status == "ready_to_confirm"
         campaign = await service.set_language_and_generate_goals(
             session=session,
             campaign=campaign,
@@ -531,6 +618,7 @@ async def test_request_campaign_followup_preserves_phones_and_accepts_ok_status(
     )
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -542,7 +630,7 @@ async def test_request_campaign_followup_preserves_phones_and_accepts_ok_status(
             campaign=campaign,
             text="Узнать наличие Ford Raptor R из наличия или ближайшей поставки, покупка без кредита.",
         )
-        assert campaign.status == "needs_language"
+        assert campaign.status == "ready_to_confirm"
         campaign = await service.set_language_and_generate_goals(
             session=session,
             campaign=campaign,
@@ -729,6 +817,7 @@ async def test_request_campaign_uses_url_context_in_confirmation() -> None:
     service.context_extractor = FakeContextExtractor()
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -738,7 +827,7 @@ async def test_request_campaign_uses_url_context_in_confirmation() -> None:
                 "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки."
             ),
         )
-        assert campaign.status == "needs_language"
+        assert campaign.status == "ready_to_confirm"
         assert campaign.source_urls_json == ["https://example.com/raptor-r"]
         assert campaign.vehicle_context_json[0]["vin"] == "1FTFW1RG0RF000001"
         campaign = await service.set_language_and_generate_goals(
@@ -767,6 +856,7 @@ async def test_request_call_starts_one_call_with_goal_ru_only_and_waits_next() -
     bot = FakeBot()
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -829,6 +919,7 @@ async def test_request_call_auto_mode_starts_next_after_report_delivery() -> Non
     bot = FakeBot()
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -879,6 +970,7 @@ async def test_request_call_finalization_is_idempotent_for_webhook_and_fallback_
     bot = FakeBot()
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -929,6 +1021,7 @@ async def test_request_campaign_generates_goal_once_for_all_targets() -> None:
     )
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -937,11 +1030,6 @@ async def test_request_campaign_generates_goal_once_for_all_targets() -> None:
                 "AutoNation Ford Jacksonville +1 (904) 513-3392\n"
                 "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки."
             ),
-        )
-        campaign = await service.set_language_and_generate_goals(
-            session=session,
-            campaign=campaign,
-            call_language="en",
         )
         targets = await service.list_targets(session, campaign.id)
         assert campaign.status == "ready_to_confirm"
@@ -1004,12 +1092,13 @@ async def test_request_call_japanese_uses_ja_agent_and_goal_only() -> None:
     )
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "JP")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
             text="東京Ford 03-1234-5678\nЗадача: Ford Raptor Rの在庫と価格を確認したい。",
         )
-        assert campaign.status == "needs_language"
+        assert campaign.status == "ready_to_confirm"
         assert campaign.phone_region == "JP"
         campaign = await service.set_language_and_generate_goals(
             session=session,
@@ -1044,6 +1133,7 @@ async def test_request_report_delivery_failure_schedules_retry(monkeypatch) -> N
 
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -1085,6 +1175,7 @@ async def test_request_call_auto_mode_does_not_start_next_when_report_delivery_f
 
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,
@@ -1136,6 +1227,7 @@ async def test_request_call_summary_after_all_targets() -> None:
     bot = FakeBot()
     async with session_maker() as session:
         campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
         campaign = await service.update_campaign_from_text(
             session=session,
             campaign=campaign,

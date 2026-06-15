@@ -18,6 +18,19 @@ def start_mode_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def request_call_country_keyboard(campaign_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="США", callback_data=f"request:country:US:{campaign_id}")
+    kb.button(text="Япония", callback_data=f"request:country:JP:{campaign_id}")
+    kb.button(text="Китай (скоро)", callback_data=f"request:country_soon:CN:{campaign_id}")
+    kb.button(text="Германия (скоро)", callback_data=f"request:country_soon:DE:{campaign_id}")
+    kb.button(text="Корея (скоро)", callback_data=f"request:country_soon:KR:{campaign_id}")
+    kb.button(text="Италия (скоро)", callback_data=f"request:country_soon:IT:{campaign_id}")
+    kb.button(text="Франция (скоро)", callback_data=f"request:country_soon:FR:{campaign_id}")
+    kb.adjust(2, 1, 2, 2)
+    return kb.as_markup()
+
+
 def request_call_input_force_reply() -> ForceReply:
     return ForceReply(
         selective=True,

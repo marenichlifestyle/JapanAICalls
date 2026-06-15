@@ -260,6 +260,7 @@ async def append_service_message_id(session: AsyncSession, *, job: Job, message_
 
 REQUEST_CAMPAIGN_INPUT_STATUSES = {
     "draft",
+    "needs_country",
     "needs_phones",
     "needs_goal",
     "needs_phones_and_goal",

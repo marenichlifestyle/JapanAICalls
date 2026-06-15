@@ -31,64 +31,6 @@ from app.utils.spoken import (
 )
 
 
-def _request_call_dealer_label(*values: str | None) -> str:
-    source = " ".join(value or "" for value in values).lower()
-    labels = (
-        ("ram", "a RAM dealership"),
-        ("dodge", "a RAM dealership"),
-        ("chrysler", "a RAM dealership"),
-        ("ford", "a Ford dealership"),
-        ("форд", "a Ford dealership"),
-        ("toyota", "a Toyota dealership"),
-        ("lexus", "a Lexus dealership"),
-        ("bmw", "a BMW dealership"),
-        ("mercedes", "a Mercedes-Benz dealership"),
-        ("mercedes-benz", "a Mercedes-Benz dealership"),
-        ("chevrolet", "a Chevrolet dealership"),
-        ("chevy", "a Chevrolet dealership"),
-        ("tesla", "a Tesla dealership"),
-        ("porsche", "a Porsche dealership"),
-        ("honda", "a Honda dealership"),
-        ("nissan", "a Nissan dealership"),
-        ("audi", "an Audi dealership"),
-        ("jeep", "a Jeep dealership"),
-        ("gmc", "a GMC dealership"),
-        ("cadillac", "a Cadillac dealership"),
-        ("hyundai", "a Hyundai dealership"),
-        ("kia", "a Kia dealership"),
-    )
-    for marker, label in labels:
-        if marker in source:
-            return label
-    return "the dealership"
-
-
-def _request_call_dealer_label_ja(*values: str | None) -> str:
-    source = " ".join(value or "" for value in values).lower()
-    labels = (
-        ("ford", "フォード販売店"),
-        ("フォード", "フォード販売店"),
-        ("toyota", "トヨタ販売店"),
-        ("トヨタ", "トヨタ販売店"),
-        ("lexus", "レクサス販売店"),
-        ("レクサス", "レクサス販売店"),
-        ("bmw", "BMW販売店"),
-        ("mercedes", "メルセデス・ベンツ販売店"),
-        ("mercedes-benz", "メルセデス・ベンツ販売店"),
-        ("メルセデス", "メルセデス・ベンツ販売店"),
-        ("honda", "ホンダ販売店"),
-        ("ホンダ", "ホンダ販売店"),
-        ("nissan", "日産販売店"),
-        ("日産", "日産販売店"),
-        ("porsche", "ポルシェ販売店"),
-        ("ポルシェ", "ポルシェ販売店"),
-    )
-    for marker, label in labels:
-        if marker in source:
-            return label
-    return "販売店"
-
-
 class OpenAIService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -788,8 +730,8 @@ class OpenAIService:
                 "Inputs: dealer_name, city, phone_e164, raw_user_goal, vehicle_context.\n"
                 "Length rule: goal_ru must be compact and natural, roughly comparable to a 70-110 word English goal. "
                 "Do not overload the call or make it sound like an interrogation.\n\n"
-                "Style rule: do not copy the exact dealer_name in goal_ru and do not use brand-specific dealer labels "
-                "such as 'フォード販売店' or 'ジープ販売店'. Start with the sales department and the vehicle/task only.\n\n"
+                "Style rule: do not copy the exact dealer_name in goal_ru and do not use brand-specific dealer labels. "
+                "Start with the sales department and the vehicle/task only.\n\n"
                 "Use vehicle_context only for concise factual identification: brand, model, year, color, power, price, "
                 "VIN/stock, mileage, if present. Do not invent facts. If user intent is vague, return "
                 "status=needs_goal_clarification, goal_ru=null, and clarification_questions.\n\n"
@@ -811,7 +753,7 @@ class OpenAIService:
                 "Length rule: goal_ru must be compact, about 70-95 words, and never more than 110 words. "
                 "Group related questions into short clauses; do not turn the call into an interrogation.\n\n"
                 "Privacy/style rule: never copy or mention the exact dealer_name in goal_ru. Also do not use "
-                "brand-specific dealer labels such as 'a Ford dealership', 'a Jeep dealership', or 'a RAM dealership'. "
+                "brand-specific dealer labels like 'a <brand> dealership'. "
                 "Start goal_ru like: 'Call the sales department about ...'. The user still sees dealer_name in Telegram; "
                 "the voice agent does not need it in the goal.\n\n"
                 "Use vehicle_context only for concise factual identification: brand, model, year, color, power, price, "

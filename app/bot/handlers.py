@@ -12,6 +12,7 @@ from app.bot.keyboards import (
     call_language_keyboard,
     request_call_input_force_reply,
     request_call_confirm_keyboard,
+    request_call_country_keyboard,
     request_call_language_keyboard,
     start_mode_keyboard,
 )
@@ -42,11 +43,23 @@ CARS_COM_URL_RE = re.compile(r"https?://(?:www\.)?cars\.com/vehicledetail/[\w\-/
 REQUEST_START_STATUSES = {"ready_to_confirm", "ready_to_call"}
 GROUP_TEXT_ADOPTABLE_CAMPAIGN_STATUSES = {
     "draft",
+    "needs_country",
     "needs_phones",
     "needs_goal",
     "needs_phones_and_goal",
     "needs_goal_clarification",
 }
+COUNTRY_LANGUAGE_BY_REGION = {"US": "en", "JP": "ja"}
+REQUEST_CALL_INSTRUCTIONS = (
+    "Пришлите список дилеров с телефонами, задачу прозвона и при необходимости ссылки на авто "
+    "одним сообщением.\n\n"
+    "Пример:\n"
+    "Duval Ford Jacksonville +1 (904) 387-6541\n"
+    "AutoNation Ford Jacksonville +1 (904) 513-3392\n\n"
+    "Ссылка: https://example.com/vehicle\n\n"
+    "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки, "
+    "покупка без кредита и лизинга, оплата переводом."
+)
 
 
 def detect_source(url: str) -> str:
@@ -129,10 +142,9 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
         if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
-        await callback.answer()
-        chat_id = callback.message.chat.id if callback.message else callback.from_user.id
-        await delete_callback_message(callback)
-        await callback.bot.send_message(chat_id, "Пришлите ссылку на объявление Carsensor или Cars.com.")
+        await callback.answer("Устаревший режим. Пользуйтесь прозвоном по запросу.", show_alert=True)
+        if callback.message:
+            await callback.message.answer("Устаревший режим. Пользуйтесь прозвоном по запросу.")
 
     @router.callback_query(F.data == "mode:request")
     async def select_request_mode(callback: CallbackQuery) -> None:
@@ -145,6 +157,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 chat_id=callback.message.chat.id if callback.message else callback.from_user.id,
                 user_id=callback.from_user.id,
                 source_message_id=None,
+                status="needs_country",
             )
         await callback.answer()
         await delete_callback_message(callback)
@@ -155,19 +168,54 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                     session=session,
                     campaign=campaign,
                     bot=callback.bot,
-                    text=(
-                        "Пришлите список дилеров с телефонами, задачу прозвона и при необходимости ссылки на авто "
-                        "одним сообщением.\n\n"
-                        "Пример:\n"
-                        "Duval Ford Jacksonville +1 (904) 387-6541\n"
-                        "AutoNation Ford Jacksonville +1 (904) 513-3392\n\n"
-                        "Ссылка: https://example.com/vehicle\n\n"
-                        "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки, "
-                        "покупка без кредита и лизинга, оплата переводом.\n\n"
-                        "После разбора я спрошу язык звонка: English или 日本語."
-                    ),
-                    reply_markup=request_call_input_force_reply(),
+                    text="Выберите страну прозвона. Номера без кода страны буду интерпретировать по выбранной стране.",
+                    reply_markup=request_call_country_keyboard(campaign.id),
                 )
+
+    @router.callback_query(F.data.startswith("request:country_soon:"))
+    async def request_country_soon(callback: CallbackQuery) -> None:
+        if not can_access_callback(callback):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        await callback.answer("Пока работает только США и Япония.", show_alert=True)
+
+    @router.callback_query(F.data.startswith("request:country:"))
+    async def request_select_country(callback: CallbackQuery) -> None:
+        if not can_access_callback(callback):
+            await callback.answer("Доступ запрещён", show_alert=True)
+            return
+        try:
+            _prefix, _country_key, country, campaign_raw = callback.data.split(":", 3)
+            if country not in COUNTRY_LANGUAGE_BY_REGION:
+                raise ValueError("unsupported country")
+            campaign_id = int(campaign_raw)
+        except Exception:
+            await callback.answer("Некорректные данные", show_alert=True)
+            return
+        async with SessionLocal() as session:
+            campaign = await get_request_campaign(session, campaign_id)
+            if not campaign:
+                await callback.answer("Кампания не найдена", show_alert=True)
+                return
+            if not await ensure_request_campaign_owner(callback, campaign):
+                return
+            if campaign.status not in {"needs_country", "draft", "needs_phones", "needs_goal", "needs_phones_and_goal"}:
+                await callback.answer(f"Кампания в статусе {campaign.status}")
+                return
+            campaign.phone_region = country
+            campaign.call_language = COUNTRY_LANGUAGE_BY_REGION[country]
+            campaign.status = "draft"
+            await session.commit()
+            await callback.answer("Страна выбрана")
+            await delete_callback_message(callback)
+            label = "США" if country == "US" else "Япония"
+            await request_service.send_service_message(
+                session=session,
+                campaign=campaign,
+                bot=callback.bot,
+                text=f"Страна прозвона: {label}.\n\n{REQUEST_CALL_INSTRUCTIONS}",
+                reply_markup=request_call_input_force_reply(),
+            )
 
     @router.message(F.text)
     async def handle_text(message: Message) -> None:
@@ -212,11 +260,28 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                     )
                     targets = await request_service.list_targets(session, campaign.id)
                     if campaign.status == "mixed_phone_regions":
+                        region_label = "США" if campaign.phone_region == "US" else "Япония" if campaign.phone_region == "JP" else "выбранной стране"
                         await request_service.send_service_message(
                             session=session,
                             campaign=campaign,
                             bot=message.bot,
-                            text="В одном запросе нашёл номера из разных стран. Выберите один язык звонка для всей кампании.",
+                            text=(
+                                "Номера не соответствуют выбранной стране или смешаны в одном запросе. "
+                                f"Сейчас выбрана страна: {region_label}. Пришлите номера только для этой страны "
+                                "или начните отдельную кампанию."
+                            ),
+                            reply_markup=request_call_input_force_reply(),
+                        )
+                    elif campaign.status == "needs_country":
+                        await request_service.send_service_message(
+                            session=session,
+                            campaign=campaign,
+                            bot=message.bot,
+                            text=(
+                                "Сначала выберите страну прозвона. Номера без кода страны буду интерпретировать "
+                                "по выбранной стране."
+                            ),
+                            reply_markup=request_call_country_keyboard(campaign.id),
                         )
                     elif campaign.status == "needs_phones":
                         await request_service.send_service_message(
