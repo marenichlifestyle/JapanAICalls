@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 PHONE_LIKE_RE = re.compile(r"(?:\+?\d[\d\s\-\(\)\.]{6,}\d)")
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
 PHONE_MATCH_REGIONS = ("US", "JP", "RU", "GB", "FR", "DE", "AE", "KZ", "TR", "KR", "CN")
-HEADER_HINTS = ("номер телефона", "phone", "телефон", "официальный дилер")
 KNOWN_CITY_SUFFIXES = (
     "Jacksonville",
     "Gainesville",
@@ -50,13 +49,6 @@ KNOWN_CITY_SUFFIXES = (
     "Nagoya",
     "Yokohama",
 )
-VAGUE_GOALS = {
-    "узнать по машинам",
-    "позвонить дилерам",
-    "прозвонить дилеров",
-    "узнать по авто",
-    "узнать по автомобилям",
-}
 READY_GOAL_STATUSES = {"ready", "ok", "success", "ready_to_confirm"}
 REQUEST_CALL_SEQUENCE_MODES = {"manual", "auto"}
 REQUEST_CALL_PROCESSING_MESSAGE = "Принято, формирую список дилеров, контекст авто и цель прозвона..."
@@ -143,6 +135,7 @@ class ParsedRequestInput:
     rejected_phones: list[RejectedPhone] = field(default_factory=list)
     source_urls: list[str] = field(default_factory=list)
     raw_user_goal: str = ""
+    has_goal_text: bool = False
 
     @property
     def phone_regions(self) -> set[str]:
@@ -155,7 +148,7 @@ class ParsedRequestInput:
     @property
     def status(self) -> str:
         has_phones = bool(self.dealers)
-        has_goal = bool(self.raw_user_goal.strip())
+        has_goal = self.has_goal_text
         if has_phones and has_goal:
             return "ready_to_confirm"
         if has_goal:
@@ -167,11 +160,6 @@ class ParsedRequestInput:
 
 def _clean_spaces(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").replace("\t", " ")).strip(" ,;-—")
-
-
-def _is_header_line(line: str) -> bool:
-    normalized = line.lower()
-    return any(h in normalized for h in HEADER_HINTS) and not PHONE_LIKE_RE.search(line)
 
 
 def _normalize_allowed_phone(raw: str, default_region: str) -> tuple[str | None, str | None]:
@@ -453,12 +441,12 @@ def _dedupe_duplicate_city(dealer_text: str, city: str | None) -> str:
 
 def parse_request_call_input(text: str, *, default_region: str | None = None) -> ParsedRequestInput:
     result = ParsedRequestInput()
-    goal_lines: list[str] = []
     default_region = (default_region or "").upper() or None
+    result.raw_user_goal = _clean_spaces(text)
 
     for raw_line in (text or "").splitlines():
         line = _clean_spaces(raw_line)
-        if not line or _is_header_line(line):
+        if not line:
             continue
 
         line_without_urls, urls = _extract_urls(line)
@@ -497,142 +485,12 @@ def parse_request_call_input(text: str, *, default_region: str | None = None) ->
             result.rejected_phones.append(RejectedPhone(original_line=line, reason="invalid_phone"))
             continue
 
-        goal_lines.append(line)
-
-    goal = "\n".join(goal_lines)
-    goal = re.sub(r"^\s*задача\s*:\s*", "", goal, flags=re.IGNORECASE)
-    result.raw_user_goal = _clean_spaces(goal)
+        result.has_goal_text = True
     return result
 
 
-def is_goal_too_vague(raw_goal: str) -> bool:
-    normalized = _clean_spaces(raw_goal).lower()
-    if not normalized:
-        return False
-    return normalized in VAGUE_GOALS
-
-
-def _constraint_parts(raw_user_goal: str) -> tuple[list[str], list[str]]:
-    lower = raw_user_goal.lower()
-    constraints: list[str] = []
-    constraint_phrases: list[str] = []
-    if "без кредит" in lower:
-        constraints.append("no_credit")
-        constraint_phrases.append("no financing")
-    if "лизинг" in lower or "leasing" in lower or "lease" in lower:
-        constraints.append("no_lease")
-        constraint_phrases.append("no leasing")
-    if "перевод" in lower:
-        constraints.append("bank_transfer")
-        constraint_phrases.append("payment by bank wire")
-    return constraints, constraint_phrases
-
-
-def _contains_dealer_label(goal_text: str | None) -> bool:
-    normalized = (goal_text or "").lower().replace("’", "'")
-    if not normalized:
-        return False
-    has_brand_dealership = bool(re.search(r"\ba[n]?\s+[a-z0-9][a-z0-9&'\- ]{1,40}\s+dealership(?:'s)?\b", normalized))
-    return has_brand_dealership or "販売店" in (goal_text or "")
-
-
-def _compact_goal_text(
-    vehicle_or_task: str,
-    constraint_phrases: list[str],
-    raw_goal: str = "",
-    *,
-    call_language: str = "en",
-) -> str:
-    constraints_text = ", ".join(constraint_phrases) or "none specified"
-    if call_language == "ja":
-        constraints_ja = "、".join(_constraint_phrases_ja(constraint_phrases)) or "指定条件なし"
-        return (
-            f"販売部門に電話し、{vehicle_or_task}について確認する。"
-            f"条件: {constraints_ja}。在庫または入庫予定、時期、価格と諸費用、グレードや色、"
-            "VIN/在庫番号、取り置きや申込金、支払い方法、書類手続きの時期を自然に確認する。"
-            "無い場合は次回入庫や近い仕様、次の連絡先を聞く。質問は短く一つずつ行い、重要な回答が曖昧なら一度だけ丁寧に聞き直す。"
-        )
-    return (
-        f"Call the sales department about {vehicle_or_task}. "
-        f"Customer constraints: {constraints_text}. Confirm availability or ETA, price/OOD plus MSRP/markup/fees, "
-        "configuration/color, VIN/stock, hold or deposit option, payment method, and paperwork timing. If unavailable, "
-        "ask for nearest delivery or a similar option and best next contact. Ask short questions, one at a time. "
-        "If a critical answer is vague, ask one concise follow-up, but keep the call natural and not like an interrogation."
-    )
-
-
-def _constraint_phrases_ja(constraint_phrases: list[str]) -> list[str]:
-    mapping = {
-        "no financing": "ローンなし",
-        "no leasing": "リースなし",
-        "payment by bank wire": "銀行振込での支払い",
-    }
-    return [mapping.get(value, value) for value in constraint_phrases]
-
-
-def fallback_goal_generation(
-    dealer: ParsedDealerLine | DealerCallTarget,
-    raw_user_goal: str,
-    *,
-    call_language: str = "en",
-    vehicle_context: list[dict[str, Any]] | None = None,
-) -> GoalGenerationResult:
-    vehicle = _extract_vehicle_hint(raw_user_goal, vehicle_context or [])
-    if not vehicle and not _clean_spaces(raw_user_goal):
-        return GoalGenerationResult(
-            status="needs_goal_clarification",
-            goal_ru=None,
-            target_vehicle=None,
-            main_intent=None,
-            constraints=[],
-            required_questions=[],
-            fallback_questions=[],
-            completion_criteria=[],
-            clarification_questions=["Что именно нужно выяснить у дилера?"],
-        )
-    vehicle_or_task = vehicle or _clean_spaces(raw_user_goal) or "the user's request"
-    constraints, constraint_phrases = _constraint_parts(raw_user_goal)
-    goal_ru = _compact_goal_text(
-        vehicle_or_task,
-        constraint_phrases,
-        raw_user_goal,
-        call_language=call_language,
-    )
-    return GoalGenerationResult(
-        status="ready",
-        goal_ru=goal_ru,
-        target_vehicle=vehicle_or_task,
-        main_intent="availability_or_nearest_incoming_unit",
-        constraints=constraints,
-        required_questions=[
-            "availability",
-            "nearest_incoming_unit",
-            "price_or_price_range",
-            "configuration",
-            "color",
-            "vin_or_stock_number",
-            "delivery_timing",
-            "paperwork_timing",
-            "payment_terms",
-        ],
-        fallback_questions=["nearest_expected_delivery", "reservation_or_waitlist", "similar_configuration"],
-        completion_criteria=[
-            "availability_or_incoming_answer_received",
-            "price_answer_received",
-            "timing_answer_received",
-            "payment_answer_received",
-            "missing_answers_marked_or_followed_up",
-        ],
-    )
-
-
-def _extract_vehicle_hint(raw_user_goal: str, vehicle_context: list[dict[str, Any]] | None = None) -> str | None:
-    for context in vehicle_context or []:
-        for key in ("vehicle_title", "title"):
-            value = _clean_spaces(context.get(key) if isinstance(context, dict) else None)
-            if value:
-                return value
-    return None
+def _has_request_goal_text(text: str | None, default_region: str | None = None) -> bool:
+    return parse_request_call_input(text or "", default_region=default_region).has_goal_text
 
 
 def _has_vehicle_context(vehicle_context: list[dict[str, Any]] | None) -> bool:
@@ -828,6 +686,7 @@ class RequestCallService:
             campaign.status = "needs_country"
             campaign.telegram_source_message_id = source_message_id or campaign.telegram_source_message_id
             campaign.raw_input = "\n".join(part for part in (campaign.raw_input, text) if part).strip()
+            campaign.raw_user_goal = campaign.raw_input
             await session.commit()
             await session.refresh(campaign)
             return campaign
@@ -839,8 +698,7 @@ class RequestCallService:
         # goal, or clarify the goal after LLM validation. Keep the existing side
         # of the campaign unless the new message actually contains replacements.
         campaign.raw_input = "\n".join(part for part in (campaign.raw_input, text) if part).strip()
-        if parsed.raw_user_goal:
-            campaign.raw_user_goal = parsed.raw_user_goal
+        campaign.raw_user_goal = campaign.raw_input
         if parsed.source_urls:
             campaign.source_urls_json = self._merge_source_urls(campaign.source_urls_json or [], parsed.source_urls)
             campaign.vehicle_context_json = await self.context_extractor.extract_many(campaign.source_urls_json)
@@ -855,13 +713,14 @@ class RequestCallService:
         )
 
         has_context = _has_vehicle_context(campaign.vehicle_context_json or [])
+        has_goal_text = _has_request_goal_text(campaign.raw_input, selected_region)
         if parsed.has_mixed_phone_regions or has_wrong_country_phone:
             campaign.status = "mixed_phone_regions"
-        elif not campaign.valid_numbers and not (campaign.raw_user_goal or "").strip() and not has_context:
+        elif not campaign.valid_numbers and not has_goal_text and not has_context:
             campaign.status = "needs_phones_and_goal"
         elif not campaign.valid_numbers:
             campaign.status = "needs_phones"
-        elif not (campaign.raw_user_goal or "").strip() and not has_context:
+        elif not has_goal_text and not has_context:
             campaign.status = "needs_goal"
         elif not campaign.call_language:
             campaign.call_language = "ja" if selected_region == "JP" else "en"
@@ -970,11 +829,9 @@ class RequestCallService:
             campaign.status = "needs_phones"
             return
 
-        # goal_ru no longer contains dealer-specific wording, so one generation
-        # per campaign is enough even for large dealer lists.
-        result = await self._generate_goal_for_target(
-            targets[0],
-            campaign.raw_user_goal or "",
+        result = await self._generate_campaign_goal(
+            campaign,
+            targets,
             call_language=campaign.call_language or "en",
             vehicle_context=campaign.vehicle_context_json or [],
         )
@@ -986,7 +843,6 @@ class RequestCallService:
 
         result.status = "ready"
         for target in targets:
-            result.status = "ready"
             target.goal_ru = result.goal_ru
         first_meta = result.model_dump()
         campaign.goal_meta_json = first_meta
@@ -1000,13 +856,26 @@ class RequestCallService:
         campaign: RequestCallCampaign,
         call_language: str,
     ) -> RequestCallCampaign:
-        campaign.call_language = "ja" if call_language == "ja" else "en"
+        normalized_language = "ja" if call_language == "ja" else "en"
+        existing_targets = await self.list_targets(session, campaign.id)
+        existing_goal_status = str((campaign.goal_meta_json or {}).get("status") or "").strip().lower()
+        if (
+            campaign.call_language == normalized_language
+            and campaign.status == "ready_to_confirm"
+            and existing_goal_status in READY_GOAL_STATUSES
+            and existing_targets
+            and all((target.goal_ru or "").strip() for target in existing_targets)
+        ):
+            return campaign
+
+        campaign.call_language = normalized_language
         if not campaign.phone_region:
             campaign.phone_region = "JP" if campaign.call_language == "ja" else "US"
         has_context = _has_vehicle_context(campaign.vehicle_context_json or [])
+        has_goal_text = _has_request_goal_text(campaign.raw_input or campaign.raw_user_goal, campaign.phone_region)
         if not campaign.valid_numbers:
             campaign.status = "needs_phones"
-        elif not (campaign.raw_user_goal or "").strip() and not has_context:
+        elif not has_goal_text and not has_context:
             campaign.status = "needs_goal"
         else:
             await self._generate_target_goals(session, campaign)
@@ -1014,94 +883,90 @@ class RequestCallService:
         await session.refresh(campaign)
         return campaign
 
-    async def _generate_goal_for_target(
+    async def _generate_campaign_goal(
         self,
-        target: DealerCallTarget,
-        raw_goal: str,
+        campaign: RequestCallCampaign,
+        targets: list[DealerCallTarget],
         *,
         call_language: str,
         vehicle_context: list[dict[str, Any]],
     ) -> GoalGenerationResult:
+        dealer_targets = [
+            {
+                "dealer_name": target.dealer_name,
+                "city": target.city,
+                "phone_e164": target.phone_e164,
+                "phone_region": target.phone_region,
+            }
+            for target in targets
+        ]
         try:
             result = await self.openai_service.generate_goal_ru(
-                dealer_name=target.dealer_name,
-                city=target.city,
-                phone_e164=target.phone_e164,
-                raw_user_goal=raw_goal,
+                dealer_name="",
+                city=None,
+                phone_e164="",
+                raw_user_goal=campaign.raw_user_goal or campaign.raw_input or "",
                 call_language=call_language,
                 vehicle_context=vehicle_context,
+                dealer_targets=dealer_targets,
             )
-            return self._ensure_compact_goal(target, raw_goal, result, call_language=call_language, vehicle_context=vehicle_context)
+            return self._validate_campaign_goal(campaign, targets, result)
         except Exception:
             logger.exception(
-                "goal generation failed; using deterministic fallback",
-                extra={"campaign_id": target.campaign_id, "target_id": target.id},
+                "request-call campaign goal generation failed",
+                extra={"campaign_id": campaign.id},
             )
-            return fallback_goal_generation(
-                target,
-                raw_goal,
-                call_language=call_language,
-                vehicle_context=vehicle_context,
+            return GoalGenerationResult(
+                status="needs_goal_clarification",
+                goal_ru=None,
+                target_vehicle=None,
+                main_intent=None,
+                constraints=[],
+                required_questions=[],
+                fallback_questions=[],
+                completion_criteria=[],
+                clarification_questions=[
+                    "Не удалось надёжно сформировать цель прозвона. Пришлите задачу ещё раз или уточните её."
+                ],
             )
 
     @staticmethod
-    def _ensure_compact_goal(
-        target: DealerCallTarget,
-        raw_goal: str,
+    def _validate_campaign_goal(
+        campaign: RequestCallCampaign,
+        targets: list[DealerCallTarget],
         result: GoalGenerationResult,
-        *,
-        call_language: str,
-        vehicle_context: list[dict[str, Any]],
     ) -> GoalGenerationResult:
         goal_text = result.goal_ru or ""
         status = (result.status or "").strip().lower()
         if status == "needs_goal_clarification" or status not in READY_GOAL_STATUSES:
             return result
-        lower_goal = goal_text.lower()
-        dealer_name = (target.dealer_name or "").strip()
-        contains_exact_dealer = bool(dealer_name and dealer_name.lower() in lower_goal)
-        contains_dealer_label = _contains_dealer_label(goal_text)
-        too_forceful = "do not end until" in lower_goal or "every mandatory item" in lower_goal
-        if (
-            goal_text
-            and _word_count(goal_text) <= REQUEST_GOAL_MAX_WORDS
-            and not contains_exact_dealer
-            and not contains_dealer_label
-            and not too_forceful
-        ):
-            return result
-        original_words = _word_count(result.goal_ru)
-        constraints, constraint_phrases = _constraint_parts(raw_goal)
-        vehicle = result.target_vehicle or _extract_vehicle_hint(raw_goal, vehicle_context) or _clean_spaces(raw_goal)
-        if not vehicle:
+        if not goal_text or _word_count(goal_text) > REQUEST_GOAL_MAX_WORDS:
             result.status = "needs_goal_clarification"
+            result.goal_ru = None
+            result.clarification_questions = result.clarification_questions or [
+                "Сформулируйте цель короче или уточните, что именно нужно сказать/спросить."
+            ]
             return result
-        result.goal_ru = _compact_goal_text(
-            vehicle,
-            constraint_phrases,
-            raw_goal,
-            call_language=call_language,
-        )
+        lower_goal = goal_text.lower()
+        for target in targets:
+            dealer_name = (target.dealer_name or "").strip()
+            if dealer_name and dealer_name.lower() in lower_goal:
+                result.status = "needs_goal_clarification"
+                result.goal_ru = None
+                result.clarification_questions = result.clarification_questions or [
+                    "Цель не должна содержать точное название дилера. Переформулируйте задачу без названия дилера."
+                ]
+                logger.warning(
+                    "request-call goal rejected because it contains exact dealer name",
+                    extra={"campaign_id": campaign.id, "target_id": target.id, "dealer_name": target.dealer_name},
+                )
+                return result
         result.status = "ready"
-        result.target_vehicle = result.target_vehicle or vehicle
-        if not result.constraints:
-            result.constraints = constraints
-        logger.info(
-            "request-call goal compacted",
-            extra={
-                "campaign_id": target.campaign_id,
-                "target_id": target.id,
-                "dealer_name": target.dealer_name,
-                "original_words": original_words,
-                "compacted_words": _word_count(result.goal_ru),
-                "max_words": REQUEST_GOAL_MAX_WORDS,
-            },
-        )
         return result
 
     @staticmethod
     def _goal_summary(raw_goal: str, meta: dict[str, Any]) -> str:
-        vehicle = meta.get("target_vehicle") or _extract_vehicle_hint(raw_goal) or "задача прозвона"
+        vehicle = meta.get("target_vehicle") or _compact_value(raw_goal, limit=80) or "задача прозвона"
         intent = meta.get("main_intent") or "наличие/условия"
         constraints = ", ".join(meta.get("constraints") or []) or "условия из сообщения"
         return f"{vehicle}. {intent}. {constraints}."

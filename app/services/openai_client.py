@@ -693,6 +693,7 @@ class OpenAIService:
         raw_user_goal: str,
         call_language: str = "en",
         vehicle_context: list[dict[str, Any]] | None = None,
+        dealer_targets: list[dict[str, Any]] | None = None,
     ) -> GoalGenerationResult:
         schema = {
             "type": "object",
@@ -722,12 +723,16 @@ class OpenAIService:
         }
         call_language = "ja" if call_language == "ja" else "en"
         context_json = json.dumps(vehicle_context or [], ensure_ascii=False)
+        targets_json = json.dumps(dealer_targets or [], ensure_ascii=False)
         if call_language == "ja":
             prompt = (
                 "You convert a user's dealership call request into a compact operational goal for a Japanese-speaking "
                 "voice agent calling a Japanese dealer or seller. Keep the JSON field name goal_ru for compatibility, "
                 "but the value must be Japanese.\n\n"
-                "Inputs: dealer_name, city, phone_e164, raw_user_goal, vehicle_context.\n"
+                "Inputs: raw_user_goal, dealer_targets, vehicle_context.\n"
+                "raw_user_goal is the authoritative full user message. It may include phone lists, URLs, table headers, "
+                "notes, and the actual task. Do not discard any user instruction because it looks like a header or "
+                "contains words like dealer, phone, inventory, invoice, or dealer-to-dealer.\n\n"
                 "Length rule: goal_ru must be compact and natural, roughly comparable to a 70-110 word English goal. "
                 "Do not overload the call or make it sound like an interrogation.\n\n"
                 "Style rule: do not copy the exact dealer_name in goal_ru and do not use brand-specific dealer labels. "
@@ -745,15 +750,17 @@ class OpenAIService:
                 "price/fees, configuration/color, VIN/stock if available, payment/paperwork constraints, fallback if "
                 "unavailable, and best next contact. Ask short questions one at a time; if a critical answer is vague, "
                 "ask one polite follow-up and then accept unknown/refusal/message request as final for that item.\n\n"
-                f"dealer_name={dealer_name}\ncity={city}\nphone_e164={phone_e164}\n"
-                f"raw_user_goal={raw_user_goal}\nvehicle_context={context_json}"
+                f"dealer_targets={targets_json}\nraw_user_goal={raw_user_goal}\nvehicle_context={context_json}"
             )
         else:
             prompt = (
                 "You convert a user's dealership call request into a precise operational call goal. "
                 "This is not a summary; it is the working script/instruction for an English-speaking "
                 "voice agent calling dealership sales departments.\n\n"
-                "Inputs: dealer_name, city, phone_e164, raw_user_goal, vehicle_context.\n"
+                "Inputs: raw_user_goal, dealer_targets, vehicle_context.\n"
+                "raw_user_goal is the authoritative full user message. It may include phone lists, URLs, table headers, "
+                "notes, and the actual task. Do not discard any user instruction because it looks like a header or "
+                "contains words like dealer, phone, inventory, invoice, or dealer-to-dealer.\n\n"
                 "Generate goal_ru in English. Keep the JSON field name goal_ru for compatibility, but "
                 "the value must be an English instruction.\n\n"
                 "Length rule: goal_ru must be compact, about 70-95 words, and never more than 110 words. "
@@ -781,8 +788,7 @@ class OpenAIService:
                 "return status=needs_goal_clarification and ask for the missing call intent. If the task is too vague, "
                 "return status=needs_goal_clarification, "
                 "goal_ru=null, and clarification_questions.\n\n"
-                f"dealer_name={dealer_name}\ncity={city}\nphone_e164={phone_e164}\n"
-                f"raw_user_goal={raw_user_goal}\nvehicle_context={context_json}"
+                f"dealer_targets={targets_json}\nraw_user_goal={raw_user_goal}\nvehicle_context={context_json}"
             )
         obj = await self._structured(prompt=prompt, schema_name="request_call_goal", schema=schema)
         return GoalGenerationResult.model_validate(obj)

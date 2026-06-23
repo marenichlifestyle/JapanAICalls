@@ -19,14 +19,11 @@ from app.services.openai_client import OpenAIService
 from app.services.request_call import (
     REQUEST_GOAL_MAX_WORDS,
     REQUEST_CALL_PROCESSING_MESSAGE,
-    ParsedDealerLine,
     RequestCallService,
     _word_count,
     build_request_campaign_summary_html_chunks,
     build_request_confirmation_text,
     build_request_target_report_html,
-    fallback_goal_generation,
-    is_goal_too_vague,
     parse_request_call_input,
 )
 
@@ -65,6 +62,7 @@ class FakeOpenAI(OpenAIService):
         raw_user_goal: str,
         call_language: str = "en",
         vehicle_context: list[dict] | None = None,
+        dealer_targets: list[dict] | None = None,
     ) -> GoalGenerationResult:
         self.goal_calls = getattr(self, "goal_calls", [])
         self.goal_calls.append(
@@ -72,6 +70,8 @@ class FakeOpenAI(OpenAIService):
                 "dealer_name": dealer_name,
                 "phone_e164": phone_e164,
                 "call_language": call_language,
+                "raw_user_goal": raw_user_goal,
+                "dealer_targets": dealer_targets or [],
             }
         )
         if call_language == "ja":
@@ -88,18 +88,11 @@ class FakeOpenAI(OpenAIService):
         return GoalGenerationResult(
             status=self.goal_status,
             goal_ru=(
-                f"Call the sales department at {dealer_name}. Ask about Ford Raptor R. "
-                "The customer is interested in a vehicle that is available now or the nearest incoming unit. "
-                "Customer constraints: no financing, no leasing, payment by bank wire. "
-                "Mandatory questions: availability, nearest incoming unit, price, configuration, color, "
-                "VIN or stock number, paperwork timing, and payment terms. "
-                "If the vehicle is incoming, ask for ETA, whether allocation is confirmed, reservation options, "
-                "deposit amount, VIN or stock number if assigned, expected price, configuration, and color. "
-                "If Ford Raptor R is unavailable, ask about the nearest expected delivery or similar configuration. "
-                "Follow-up policy: ask one question at a time; if the answer is incomplete, rephrase and ask "
-                "for specifics. Do not end the call until every mandatory item has an answer or the seller "
-                "explicitly says they do not know. The call is successful if answers are obtained for "
-                "availability, price, timing, and payment."
+                "Call the sales department about Ford Raptor R. Ask whether a unit is available now or incoming soon. "
+                "Confirm availability or ETA, price/OOD plus MSRP/markup/fees, configuration/color, VIN/stock, "
+                "payment by bank wire with no financing or lease, and paperwork timing. If unavailable, ask for the "
+                "nearest incoming option and best next contact. Ask one concise follow-up only when a critical answer "
+                "is vague, then accept unknown or refusal."
             ),
             target_vehicle="Ford Raptor R",
             main_intent="availability_or_nearest_incoming_unit",
@@ -236,6 +229,11 @@ class FakeContextExtractor:
         ]
 
 
+class FailingGoalOpenAI(FakeOpenAI):
+    async def generate_goal_ru(self, **kwargs) -> GoalGenerationResult:
+        raise RuntimeError("openai unavailable")
+
+
 def _settings() -> Settings:
     return Settings(
         TELEGRAM_ADMIN_IDS="1",
@@ -309,7 +307,7 @@ def test_parse_request_call_input_preserves_dealer_to_dealer_goal_line() -> None
     ]
     assert "dealer to dealer можем ли купить" in parsed.raw_user_goal
     assert "Больше вопросов задавать не нужно" in parsed.raw_user_goal
-    assert not parsed.raw_user_goal.startswith("Задача:")
+    assert "Задача:" in parsed.raw_user_goal
 
 
 def test_parse_request_call_input_supports_jp_phones_urls_and_mixed_regions() -> None:
@@ -322,7 +320,9 @@ def test_parse_request_call_input_supports_jp_phones_urls_and_mixed_regions() ->
     assert parsed.dealers[0].phone_e164 == "+81312345678"
     assert parsed.dealers[0].phone_region == "JP"
     assert parsed.source_urls == ["https://example.jp/car/123"]
-    assert parsed.raw_user_goal == "уточнить BMW M3 в наличии."
+    assert "東京BMW 03-1234-5678" in parsed.raw_user_goal
+    assert "https://example.jp/car/123" in parsed.raw_user_goal
+    assert "Задача: уточнить BMW M3 в наличии." in parsed.raw_user_goal
 
     mixed = parse_request_call_input(
         "Duval Ford +1 (904) 387-6541\n"
@@ -362,7 +362,9 @@ def test_parse_request_call_input_missing_data_statuses_and_invalid_phone() -> N
     assert invalid.status == "needs_phones"
     assert invalid.rejected_phones[0].reason == "invalid_phone"
 
-    assert is_goal_too_vague("узнать по машинам")
+    vague = parse_request_call_input("Duval Ford +1 (904) 387-6541\nузнать по машинам")
+    assert vague.status == "ready_to_confirm"
+    assert "узнать по машинам" in vague.raw_user_goal
 
 
 def test_parse_request_call_input_accepts_bare_us_ten_digit_numbers() -> None:
@@ -484,23 +486,15 @@ def test_ram_trx_goal_is_not_treated_as_vague() -> None:
     parsed = parse_request_call_input(text)
     assert parsed.status == "ready_to_confirm"
     assert parsed.dealers[0].phone_e164 == "+12604355330"
-    assert not is_goal_too_vague(parsed.raw_user_goal)
-
-    fallback = fallback_goal_generation(parsed.dealers[0], parsed.raw_user_goal, call_language="en")
-    assert fallback.status == "ready"
-    assert "RAM TRX SRT 2026" in (fallback.goal_ru or "")
-    assert "Jeep dealership" not in (fallback.goal_ru or "")
-    assert "RAM dealership" not in (fallback.goal_ru or "")
-    assert "price" in (fallback.goal_ru or "").lower()
+    assert "RAM TRX SRT 2026" in parsed.raw_user_goal
+    assert "Доступные комплектации" in parsed.raw_user_goal
 
 
 def test_goal_clarification_from_llm_is_respected() -> None:
-    result = RequestCallService._ensure_compact_goal(
-        SimpleNamespace(dealer_name="O'Daniel Chrysler Dodge Jeep Ram", campaign_id=1, id=1),
-        "RAM TRX SRT 2026 Когда можно будет заказать? какой ценник?",
+    result = RequestCallService._validate_campaign_goal(
+        SimpleNamespace(id=1),
+        [SimpleNamespace(dealer_name="O'Daniel Chrysler Dodge Jeep Ram", id=1)],
         GoalGenerationResult(status="needs_goal_clarification", goal_ru=None),
-        call_language="en",
-        vehicle_context=[],
     )
     assert result.status == "needs_goal_clarification"
     assert result.goal_ru is None
@@ -560,9 +554,10 @@ async def test_request_report_prompt_marks_missing_required_answers() -> None:
 async def test_request_campaign_generates_confirmation_and_goal_ru() -> None:
     engine, session_maker = await _session_maker()
     settings = _settings()
+    openai = FakeOpenAI(settings)
     service = RequestCallService(
         settings=settings,
-        openai_service=FakeOpenAI(settings),
+        openai_service=openai,
         elevenlabs_service=FakeEleven(settings),
     )
     async with session_maker() as session:
@@ -573,6 +568,7 @@ async def test_request_campaign_generates_confirmation_and_goal_ru() -> None:
             campaign=campaign,
             text=(
                 "Duval Ford Jacksonville +1 (904) 387-6541\n"
+                "AutoNation Ford Jacksonville +1 (904) 513-3392\n"
                 "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки, "
                 "покупка без кредита и лизинга, оплата переводом."
             ),
@@ -586,10 +582,14 @@ async def test_request_campaign_generates_confirmation_and_goal_ru() -> None:
         )
         targets = await service.list_targets(session, campaign.id)
         assert campaign.status == "ready_to_confirm"
-        assert campaign.valid_numbers == 1
+        assert campaign.valid_numbers == 2
         assert campaign.call_language == "en"
+        assert len(openai.goal_calls) == 1
+        assert len(openai.goal_calls[0]["dealer_targets"]) == 2
+        assert "AutoNation Ford Jacksonville +1 (904) 513-3392" in openai.goal_calls[0]["raw_user_goal"]
         assert "Duval Ford Jacksonville" not in targets[0].goal_ru
         assert "Ford dealership" not in targets[0].goal_ru
+        assert targets[0].goal_ru == targets[1].goal_ru
         assert "Call the sales department about" in targets[0].goal_ru
         assert "Ford Raptor R" in targets[0].goal_ru
         assert _word_count(targets[0].goal_ru) <= REQUEST_GOAL_MAX_WORDS
@@ -598,63 +598,14 @@ async def test_request_campaign_generates_confirmation_and_goal_ru() -> None:
         assert "concise follow-up" in targets[0].goal_ru
         assert "Do not end" not in targets[0].goal_ru
         text = build_request_confirmation_text(campaign, targets)
-        assert "Нашёл 1 валидных номеров" in text
+        assert "Нашёл 2 валидных номеров" in text
         assert "Язык звонка: английский" in text
         assert "Цель для агента (EN):" in text
         assert "Call the sales department" in text
         assert "Ключевые вопросы:" in text
         assert "наличие/поставка" in text
-        assert "Выберите режим запуска прозвона 1 номеров" in text
+        assert "Выберите режим запуска прозвона 2 номеров" in text
     await engine.dispose()
-
-
-def test_fallback_goal_generation_is_compact_english() -> None:
-    dealer = ParsedDealerLine(
-        dealer_name="Duval Ford Jacksonville",
-        city="Jacksonville",
-        phone_raw="+1 (904) 387-6541",
-        phone_e164="+19043876541",
-        phone_region="US",
-        original_line="Duval Ford Jacksonville +1 (904) 387-6541",
-    )
-    result = fallback_goal_generation(
-        dealer,
-        "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки, "
-        "покупка без кредита и лизинга, оплата переводом.",
-    )
-
-    assert result.goal_ru is not None
-    assert _word_count(result.goal_ru) <= REQUEST_GOAL_MAX_WORDS
-    assert "Call the sales department" in result.goal_ru
-    assert "Duval Ford Jacksonville" not in result.goal_ru
-    assert "Ford dealership" not in result.goal_ru
-    assert "Call the sales department about" in result.goal_ru
-    assert "availability or ETA" in result.goal_ru
-    assert "VIN/stock" in result.goal_ru
-    assert "no financing" in result.goal_ru
-    assert "no leasing" in result.goal_ru
-    assert "Do not end" not in result.goal_ru
-
-
-def test_fallback_goal_generation_supports_japanese() -> None:
-    dealer = ParsedDealerLine(
-        dealer_name="東京Ford",
-        city="Tokyo",
-        phone_raw="03-1234-5678",
-        phone_e164="+81312345678",
-        phone_region="JP",
-        original_line="東京Ford 03-1234-5678",
-    )
-    result = fallback_goal_generation(
-        dealer,
-        "Ford Raptor Rの在庫と価格を確認したい。",
-        call_language="ja",
-    )
-    assert result.goal_ru is not None
-    assert "販売部門" in result.goal_ru
-    assert "販売店" not in result.goal_ru
-    assert "在庫" in result.goal_ru
-    assert "価格" in result.goal_ru
 
 
 @pytest.mark.asyncio
@@ -694,6 +645,31 @@ async def test_request_campaign_followup_preserves_phones_and_accepts_ok_status(
         assert targets[0].phone_e164 == "+19043876541"
         assert "Ford Raptor R" in targets[0].goal_ru
         assert "availability or ETA" in targets[0].goal_ru
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_campaign_does_not_create_fallback_goal_when_openai_fails() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FailingGoalOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="Duval Ford Jacksonville +1 (904) 387-6541\nЗадача: узнать наличие Ford Raptor R.",
+        )
+        targets = await service.list_targets(session, campaign.id)
+
+        assert campaign.status == "needs_goal_clarification"
+        assert targets[0].goal_ru is None
+        assert campaign.goal_meta_json["status"] == "needs_goal_clarification"
     await engine.dispose()
 
 
