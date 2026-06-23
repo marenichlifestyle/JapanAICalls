@@ -288,6 +288,30 @@ def test_parse_request_call_input_splits_dealers_goal_and_headers() -> None:
     assert parsed.status == "ready_to_confirm"
 
 
+def test_parse_request_call_input_preserves_dealer_to_dealer_goal_line() -> None:
+    parsed = parse_request_call_input(
+        """
+        +1 (405) 507-7529
+
+        https://www.cars.com/vehicledetail/f4fd33ce-acf2-4cc0-b31c-35981baddc06/?attribution_type=isa
+
+        Задача: сказать, что мы только что по нему уже звонили и вы так и не ответили
+        на вопрос dealer to dealer можем ли купить, если да, то готовы рассматривать покупку.
+        Больше вопросов задавать не нужно, завершить звонок сказав, что с вами свяжемся
+        """,
+        default_region="US",
+    )
+
+    assert parsed.status == "ready_to_confirm"
+    assert parsed.dealers[0].phone_e164 == "+14055077529"
+    assert parsed.source_urls == [
+        "https://www.cars.com/vehicledetail/f4fd33ce-acf2-4cc0-b31c-35981baddc06/?attribution_type=isa"
+    ]
+    assert "dealer to dealer можем ли купить" in parsed.raw_user_goal
+    assert "Больше вопросов задавать не нужно" in parsed.raw_user_goal
+    assert not parsed.raw_user_goal.startswith("Задача:")
+
+
 def test_parse_request_call_input_supports_jp_phones_urls_and_mixed_regions() -> None:
     parsed = parse_request_call_input(
         "東京BMW 03-1234-5678\n"
@@ -503,6 +527,9 @@ async def test_goal_generation_prompt_requires_follow_up_questions() -> None:
     assert "a <brand> dealership" in openai.last_prompt
     assert "Do not normalize or correct vehicle brand/model names" in openai.last_prompt
     assert "vehicle_context identifies the vehicle" in openai.last_prompt
+    assert "Preserve explicit user instructions from raw_user_goal" in openai.last_prompt
+    assert "do not replace the user's request with 'no questions'" in openai.last_prompt
+    assert "dealer-to-dealer purchase is possible" in openai.last_prompt
     assert "Call the sales department about" in openai.last_prompt
     assert "availability or incoming ETA" in openai.last_prompt
     assert "keep the call natural" in openai.last_prompt

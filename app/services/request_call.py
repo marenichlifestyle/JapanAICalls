@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 PHONE_LIKE_RE = re.compile(r"(?:\+?\d[\d\s\-\(\)\.]{6,}\d)")
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
 PHONE_MATCH_REGIONS = ("US", "JP", "RU", "GB", "FR", "DE", "AE", "KZ", "TR", "KR", "CN")
-HEADER_HINTS = ("номер телефона", "phone", "телефон", "официальный дилер", "dealer")
+HEADER_HINTS = ("номер телефона", "phone", "телефон", "официальный дилер")
 KNOWN_CITY_SUFFIXES = (
     "Jacksonville",
     "Gainesville",
