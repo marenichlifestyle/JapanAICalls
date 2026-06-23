@@ -1,4 +1,4 @@
-from aiogram.types import ForceReply, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -27,15 +27,16 @@ def request_call_country_keyboard(campaign_id: int) -> InlineKeyboardMarkup:
     kb.button(text="Корея (скоро)", callback_data=f"request:country_soon:KR:{campaign_id}")
     kb.button(text="Италия (скоро)", callback_data=f"request:country_soon:IT:{campaign_id}")
     kb.button(text="Франция (скоро)", callback_data=f"request:country_soon:FR:{campaign_id}")
-    kb.adjust(2, 1, 2, 2)
+    kb.button(text="Отмена", callback_data=f"request:cancel:{campaign_id}")
+    kb.adjust(2, 1, 2, 2, 1)
     return kb.as_markup()
 
 
-def request_call_input_force_reply() -> ForceReply:
-    return ForceReply(
-        selective=True,
-        input_field_placeholder="Список дилеров, телефоны и задача",
-    )
+def request_call_cancel_keyboard(campaign_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Отмена", callback_data=f"request:cancel:{campaign_id}")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 def call_language_keyboard(job_id: int, source: str | None = None) -> InlineKeyboardMarkup:
@@ -83,6 +84,7 @@ def request_call_language_keyboard(campaign_id: int, recommended: str | None = N
         ja_label += " (рекомендовано)"
     kb.button(text=en_label, callback_data=f"request:lang:en:{campaign_id}")
     kb.button(text=ja_label, callback_data=f"request:lang:ja:{campaign_id}")
+    kb.button(text="Отмена", callback_data=f"request:cancel:{campaign_id}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -90,6 +92,6 @@ def request_call_language_keyboard(campaign_id: int, recommended: str | None = N
 def request_call_next_keyboard(campaign_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Прозвонить следующего", callback_data=f"request:next:{campaign_id}")
-    kb.button(text="Остановить", callback_data=f"request:stop:{campaign_id}")
+    kb.button(text="Отмена", callback_data=f"request:cancel:{campaign_id}")
     kb.adjust(1)
     return kb.as_markup()

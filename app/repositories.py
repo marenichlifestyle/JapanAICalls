@@ -291,6 +291,8 @@ async def create_request_campaign(
     *,
     chat_id: int,
     user_id: int,
+    username: str | None = None,
+    display_name: str | None = None,
     source_message_id: int | None = None,
     raw_input: str | None = None,
     raw_user_goal: str | None = None,
@@ -299,6 +301,8 @@ async def create_request_campaign(
     campaign = RequestCallCampaign(
         telegram_chat_id=chat_id,
         telegram_user_id=user_id,
+        telegram_username=username,
+        telegram_user_display_name=display_name,
         telegram_source_message_id=source_message_id,
         raw_input=raw_input,
         raw_user_goal=raw_user_goal,
@@ -356,24 +360,6 @@ async def get_latest_input_request_campaign(
     if campaign and campaign.status in REQUEST_CAMPAIGN_INPUT_STATUSES:
         return campaign
     return None
-
-
-async def get_latest_input_request_campaign_in_chat(
-    session: AsyncSession,
-    *,
-    chat_id: int,
-) -> RequestCallCampaign | None:
-    stmt = (
-        select(RequestCallCampaign)
-        .where(
-            RequestCallCampaign.telegram_chat_id == chat_id,
-            RequestCallCampaign.status.in_(REQUEST_CAMPAIGN_INPUT_STATUSES),
-        )
-        .order_by(RequestCallCampaign.id.desc())
-        .limit(1)
-    )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none()
 
 
 async def list_request_targets(session: AsyncSession, campaign_id: int) -> list[DealerCallTarget]:

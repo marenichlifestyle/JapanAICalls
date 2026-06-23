@@ -4,7 +4,13 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeDefault
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+    MenuButtonCommands,
+)
 
 from app.bot.handlers import create_router
 from app.config import get_settings
@@ -17,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 async def configure_bot_commands(bot: Bot) -> None:
-    commands = [BotCommand(command="start", description="Выбрать режим прозвона")]
+    commands = [
+        BotCommand(command="start", description="Выбрать режим прозвона"),
+        BotCommand(command="request", description="Начать прозвон по запросу"),
+        BotCommand(command="cancel", description="Отменить активную задачу прозвона"),
+    ]
     scopes = (
         BotCommandScopeDefault(),
         BotCommandScopeAllPrivateChats(),
@@ -28,6 +38,10 @@ async def configure_bot_commands(bot: Bot) -> None:
             await bot.set_my_commands(commands, scope=scope)
         except Exception:
             logger.exception("failed to set telegram bot commands", extra={"status": scope.type})
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands(type="commands"))
+    except Exception:
+        logger.exception("failed to set telegram bot command menu button")
 
 
 async def main() -> None:

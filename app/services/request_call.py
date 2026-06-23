@@ -15,7 +15,7 @@ from phonenumbers import NumberParseException
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.keyboards import request_call_next_keyboard
+from app.bot.keyboards import request_call_cancel_keyboard, request_call_next_keyboard
 from app.config import Settings
 from app.models import CallReport, DealerCallTarget, Job, RequestCallCampaign
 from app.schemas import GoalGenerationResult, RequestCallReportResult
@@ -82,6 +82,43 @@ EMPTY_REPORT_VALUES = {
     "не выяснили",
 }
 REQUEST_CALL_FINALIZATION_LOCK_CLASS_ID = 62041
+REQUEST_CAMPAIGN_INPUT_STATUSES = {
+    "draft",
+    "needs_country",
+    "needs_phones",
+    "needs_goal",
+    "needs_phones_and_goal",
+    "needs_goal_clarification",
+    "needs_language",
+    "mixed_phone_regions",
+    "ready_to_confirm",
+    "ready_to_call",
+}
+REQUEST_CAMPAIGN_RUNNING_STATUSES = {"calling", "waiting_call_result", "waiting_next"}
+REQUEST_CAMPAIGN_TERMINAL_STATUSES = {"completed", "stopped", "canceled"}
+REQUEST_TARGET_TERMINAL_STATUSES = {
+    "completed",
+    "no_answer",
+    "busy",
+    "failed",
+    "refused",
+    "asked_to_message",
+    "call_create_failed",
+    "provider_timeout",
+    "timeout",
+    "canceled",
+}
+REQUEST_JOB_TERMINAL_STATUSES = {
+    "completed",
+    "no_answer",
+    "busy",
+    "failed",
+    "canceled",
+    "canceled_by_review",
+    "call_create_failed",
+    "provider_timeout",
+    "timeout",
+}
 
 
 @dataclass
@@ -275,16 +312,35 @@ def _report_has_useful_result(report: CallReport) -> bool:
     return any(_compact_value(value, limit=180) for value in useful_fields)
 
 
-def build_request_target_report_html(target: DealerCallTarget, report: CallReport) -> str:
+def _campaign_owner_mention(campaign: RequestCallCampaign | None) -> str | None:
+    if campaign is None:
+        return None
+    username = _clean_spaces(campaign.telegram_username or "").lstrip("@")
+    if username:
+        return f"@{html.escape(username)}"
+    if not campaign.telegram_user_id:
+        return None
+    display_name = _compact_value(campaign.telegram_user_display_name, limit=80) or f"user {campaign.telegram_user_id}"
+    return f'<a href="tg://user?id={int(campaign.telegram_user_id)}">{html.escape(display_name)}</a>'
+
+
+def build_request_target_report_html(
+    target: DealerCallTarget,
+    report: CallReport,
+    campaign: RequestCallCampaign | None = None,
+) -> str:
     availability = _join_compact_values(report.availability_result, report.incoming_result)
     payment_docs = _join_compact_values(report.payment_result, report.paperwork_result)
     next_action = _join_compact_values(report.next_action, report.important_notes)
+    owner = _campaign_owner_mention(campaign)
     lines = [
         f"<b>Отчёт: {html.escape(target.dealer_name)}</b>",
         "━━━━━━━━━━━━",
         f"<b>Статус:</b> {html.escape(_status_label(report.call_status))}",
-        f"<b>Номер:</b> <code>{html.escape(target.phone_e164)}</code>",
     ]
+    if owner:
+        lines.append(f"<b>Поставил задачу:</b> {owner}")
+    lines.append(f"<b>Номер:</b> <code>{html.escape(target.phone_e164)}</code>")
     if report.ai_quality_score is not None:
         reason = _html_value(report.ai_quality_reason, limit=180)
         suffix = f" ({reason})" if reason else ""
@@ -453,22 +509,7 @@ def is_goal_too_vague(raw_goal: str) -> bool:
     normalized = _clean_spaces(raw_goal).lower()
     if not normalized:
         return False
-    if normalized in VAGUE_GOALS:
-        return True
-    has_vehicle_or_task = bool(
-        re.search(
-            r"\b("
-            r"ford|raptor|ram|trx|srt|dodge|chrysler|bmw|mercedes|tesla|toyota|honda|porsche|"
-            r"m3|m4|g63|gls|машин|авто|налич|постав|заказ|заказать|ценник|цена|комплектац|"
-            r"форд|раптор|рам|тойот|мерседес"
-            r")\b",
-            normalized,
-            re.IGNORECASE,
-        )
-    )
-    if len(normalized.split()) < 4 and not has_vehicle_or_task:
-        return True
-    return not has_vehicle_or_task
+    return normalized in VAGUE_GOALS
 
 
 def _constraint_parts(raw_user_goal: str) -> tuple[list[str], list[str]]:
@@ -496,8 +537,7 @@ def _contains_dealer_label(goal_text: str | None) -> bool:
 
 
 def _compact_goal_text(
-    dealer_name: str,
-    vehicle: str,
+    vehicle_or_task: str,
     constraint_phrases: list[str],
     raw_goal: str = "",
     *,
@@ -507,13 +547,13 @@ def _compact_goal_text(
     if call_language == "ja":
         constraints_ja = "、".join(_constraint_phrases_ja(constraint_phrases)) or "指定条件なし"
         return (
-            f"販売部門に電話し、{vehicle}について確認する。"
+            f"販売部門に電話し、{vehicle_or_task}について確認する。"
             f"条件: {constraints_ja}。在庫または入庫予定、時期、価格と諸費用、グレードや色、"
             "VIN/在庫番号、取り置きや申込金、支払い方法、書類手続きの時期を自然に確認する。"
             "無い場合は次回入庫や近い仕様、次の連絡先を聞く。質問は短く一つずつ行い、重要な回答が曖昧なら一度だけ丁寧に聞き直す。"
         )
     return (
-        f"Call the sales department about {vehicle}: available now or nearest incoming unit. "
+        f"Call the sales department about {vehicle_or_task}. "
         f"Customer constraints: {constraints_text}. Confirm availability or ETA, price/OOD plus MSRP/markup/fees, "
         "configuration/color, VIN/stock, hold or deposit option, payment method, and paperwork timing. If unavailable, "
         "ask for nearest delivery or a similar option and best next contact. Ask short questions, one at a time. "
@@ -537,12 +577,23 @@ def fallback_goal_generation(
     call_language: str = "en",
     vehicle_context: list[dict[str, Any]] | None = None,
 ) -> GoalGenerationResult:
-    vehicle = _extract_vehicle_hint(raw_user_goal, vehicle_context or []) or "the requested vehicle or task"
+    vehicle = _extract_vehicle_hint(raw_user_goal, vehicle_context or [])
+    if not vehicle and not _clean_spaces(raw_user_goal):
+        return GoalGenerationResult(
+            status="needs_goal_clarification",
+            goal_ru=None,
+            target_vehicle=None,
+            main_intent=None,
+            constraints=[],
+            required_questions=[],
+            fallback_questions=[],
+            completion_criteria=[],
+            clarification_questions=["Что именно нужно выяснить у дилера?"],
+        )
+    vehicle_or_task = vehicle or _clean_spaces(raw_user_goal) or "the user's request"
     constraints, constraint_phrases = _constraint_parts(raw_user_goal)
-    dealer_name = dealer.dealer_name
     goal_ru = _compact_goal_text(
-        dealer_name,
-        vehicle,
+        vehicle_or_task,
         constraint_phrases,
         raw_user_goal,
         call_language=call_language,
@@ -550,7 +601,7 @@ def fallback_goal_generation(
     return GoalGenerationResult(
         status="ready",
         goal_ru=goal_ru,
-        target_vehicle=vehicle,
+        target_vehicle=vehicle_or_task,
         main_intent="availability_or_nearest_incoming_unit",
         constraints=constraints,
         required_questions=[
@@ -581,22 +632,18 @@ def _extract_vehicle_hint(raw_user_goal: str, vehicle_context: list[dict[str, An
             value = _clean_spaces(context.get(key) if isinstance(context, dict) else None)
             if value:
                 return value
-    match = re.search(
-        r"\b("
-        r"RAM\s+TRX\s+SRT(?:\s+\d{4})?|RAM\s+TRX(?:\s+\d{4})?|"
-        r"Ford\s+Raptor\s+R|BMW\s+M3\s+Competition|BMW\s+M4\s+Competition|Mercedes[-\s]AMG\s+G\s*63"
-        r")\b",
-        raw_user_goal,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1)
-    if re.search(r"\b(форд|ford)\s+(раптор|raptor)\s+r\b", raw_user_goal, re.IGNORECASE):
-        return "Ford Raptor R"
-    after = re.search(r"(?:по|уточнить|интересует)\s+([A-ZА-ЯЁ][\wА-Яа-яЁё\-\s]{2,60}?)(?:\s+из|\s+в\s+налич|\s+без|\.|,|$)", raw_user_goal)
-    if after:
-        return _clean_spaces(after.group(1))
     return None
+
+
+def _has_vehicle_context(vehicle_context: list[dict[str, Any]] | None) -> bool:
+    for context in vehicle_context or []:
+        if not isinstance(context, dict):
+            continue
+        if _clean_spaces(context.get("vehicle_title")):
+            return True
+        if any(_clean_spaces(context.get(key)) for key in ("make", "model", "year", "vin", "stock_number")):
+            return True
+    return False
 
 
 class RequestCallService:
@@ -620,10 +667,14 @@ class RequestCallService:
         user_id: int,
         source_message_id: int | None = None,
         status: str = "draft",
+        username: str | None = None,
+        display_name: str | None = None,
     ) -> RequestCallCampaign:
         campaign = RequestCallCampaign(
             telegram_chat_id=chat_id,
             telegram_user_id=user_id,
+            telegram_username=username,
+            telegram_user_display_name=display_name,
             telegram_source_message_id=source_message_id,
             status=status,
             call_sequence_mode="manual",
@@ -634,6 +685,20 @@ class RequestCallService:
         await session.commit()
         await session.refresh(campaign)
         return campaign
+
+    async def update_campaign_owner(
+        self,
+        *,
+        session: AsyncSession,
+        campaign: RequestCallCampaign,
+        user_id: int,
+        username: str | None,
+        display_name: str | None,
+    ) -> None:
+        campaign.telegram_user_id = user_id
+        campaign.telegram_username = username
+        campaign.telegram_user_display_name = display_name
+        await session.commit()
 
     async def record_service_message(
         self,
@@ -659,6 +724,8 @@ class RequestCallService:
         text: str,
         **kwargs: Any,
     ):
+        if "reply_markup" not in kwargs and campaign.status not in REQUEST_CAMPAIGN_TERMINAL_STATUSES:
+            kwargs["reply_markup"] = request_call_cancel_keyboard(campaign.id)
         message = await safe_send_message(bot, campaign.telegram_chat_id, text, **kwargs)
         if message is not None:
             await self.record_service_message(session=session, campaign=campaign, message_id=message.message_id)
@@ -683,6 +750,70 @@ class RequestCallService:
                 await safe_delete_message(bot, job.telegram_chat_id, message_id)
             job.telegram_service_message_ids = []
         await session.commit()
+
+    async def cancel_campaign(
+        self,
+        *,
+        session: AsyncSession,
+        campaign: RequestCallCampaign,
+        bot: Bot,
+    ) -> None:
+        campaign.status = "canceled"
+        targets = await self.list_targets(session, campaign.id)
+        for target in targets:
+            if target.status not in REQUEST_TARGET_TERMINAL_STATUSES:
+                target.status = "canceled"
+        stmt = select(Job).where(Job.request_campaign_id == campaign.id)
+        jobs = list((await session.execute(stmt)).scalars().all())
+        now = datetime.now(timezone.utc)
+        for job in jobs:
+            if job.status not in REQUEST_JOB_TERMINAL_STATUSES:
+                job.status = "canceled"
+                job.call_status = "canceled"
+                job.completed_at = job.completed_at or now
+        await session.commit()
+        await self.cleanup_service_messages(session=session, campaign=campaign, bot=bot)
+
+    async def cancel_input_campaigns_for_owner(
+        self,
+        *,
+        session: AsyncSession,
+        chat_id: int,
+        user_id: int,
+        bot: Bot,
+    ) -> int:
+        stmt = select(RequestCallCampaign).where(
+            RequestCallCampaign.telegram_chat_id == chat_id,
+            RequestCallCampaign.telegram_user_id == user_id,
+            RequestCallCampaign.status.in_(REQUEST_CAMPAIGN_INPUT_STATUSES),
+        )
+        campaigns = list((await session.execute(stmt)).scalars().all())
+        for campaign in campaigns:
+            logger.info(
+                "request-call stale input campaign canceled before new session",
+                extra={"campaign_id": campaign.id, "chat_id": chat_id, "user_id": user_id, "status": campaign.status},
+            )
+            await self.cancel_campaign(session=session, campaign=campaign, bot=bot)
+        return len(campaigns)
+
+    async def get_running_campaign_for_owner(
+        self,
+        *,
+        session: AsyncSession,
+        chat_id: int,
+        user_id: int,
+    ) -> RequestCallCampaign | None:
+        stmt = (
+            select(RequestCallCampaign)
+            .where(
+                RequestCallCampaign.telegram_chat_id == chat_id,
+                RequestCallCampaign.telegram_user_id == user_id,
+                RequestCallCampaign.status.in_(REQUEST_CAMPAIGN_RUNNING_STATUSES),
+            )
+            .order_by(RequestCallCampaign.id.desc())
+            .limit(1)
+        )
+        return (await session.execute(stmt)).scalar_one_or_none()
 
     async def update_campaign_from_text(
         self,
@@ -723,16 +854,15 @@ class RequestCallService:
             str(row.reason).startswith("wrong_country_expected_") for row in parsed.rejected_phones
         )
 
+        has_context = _has_vehicle_context(campaign.vehicle_context_json or [])
         if parsed.has_mixed_phone_regions or has_wrong_country_phone:
             campaign.status = "mixed_phone_regions"
-        elif not campaign.valid_numbers and not (campaign.raw_user_goal or "").strip():
+        elif not campaign.valid_numbers and not (campaign.raw_user_goal or "").strip() and not has_context:
             campaign.status = "needs_phones_and_goal"
         elif not campaign.valid_numbers:
             campaign.status = "needs_phones"
-        elif not (campaign.raw_user_goal or "").strip():
+        elif not (campaign.raw_user_goal or "").strip() and not has_context:
             campaign.status = "needs_goal"
-        elif is_goal_too_vague(campaign.raw_user_goal or ""):
-            campaign.status = "needs_goal_clarification"
         elif not campaign.call_language:
             campaign.call_language = "ja" if selected_region == "JP" else "en"
             await self._generate_target_goals(session, campaign)
@@ -873,12 +1003,11 @@ class RequestCallService:
         campaign.call_language = "ja" if call_language == "ja" else "en"
         if not campaign.phone_region:
             campaign.phone_region = "JP" if campaign.call_language == "ja" else "US"
+        has_context = _has_vehicle_context(campaign.vehicle_context_json or [])
         if not campaign.valid_numbers:
             campaign.status = "needs_phones"
-        elif not (campaign.raw_user_goal or "").strip():
+        elif not (campaign.raw_user_goal or "").strip() and not has_context:
             campaign.status = "needs_goal"
-        elif is_goal_too_vague(campaign.raw_user_goal or ""):
-            campaign.status = "needs_goal_clarification"
         else:
             await self._generate_target_goals(session, campaign)
         await session.commit()
@@ -925,6 +1054,9 @@ class RequestCallService:
         vehicle_context: list[dict[str, Any]],
     ) -> GoalGenerationResult:
         goal_text = result.goal_ru or ""
+        status = (result.status or "").strip().lower()
+        if status == "needs_goal_clarification" or status not in READY_GOAL_STATUSES:
+            return result
         lower_goal = goal_text.lower()
         dealer_name = (target.dealer_name or "").strip()
         contains_exact_dealer = bool(dealer_name and dealer_name.lower() in lower_goal)
@@ -940,9 +1072,11 @@ class RequestCallService:
             return result
         original_words = _word_count(result.goal_ru)
         constraints, constraint_phrases = _constraint_parts(raw_goal)
-        vehicle = result.target_vehicle or _extract_vehicle_hint(raw_goal, vehicle_context) or "the requested vehicle or task"
+        vehicle = result.target_vehicle or _extract_vehicle_hint(raw_goal, vehicle_context) or _clean_spaces(raw_goal)
+        if not vehicle:
+            result.status = "needs_goal_clarification"
+            return result
         result.goal_ru = _compact_goal_text(
-            target.dealer_name,
             vehicle,
             constraint_phrases,
             raw_goal,
@@ -981,6 +1115,13 @@ class RequestCallService:
         return list((await session.execute(stmt)).scalars().all())
 
     async def start_next_call(self, *, session: AsyncSession, campaign: RequestCallCampaign, bot: Bot) -> Job | None:
+        await session.refresh(campaign)
+        if campaign.status in REQUEST_CAMPAIGN_TERMINAL_STATUSES:
+            logger.info(
+                "request-call next call skipped: campaign terminal",
+                extra={"campaign_id": campaign.id, "status": campaign.status},
+            )
+            return None
         targets = await self.list_targets(session, campaign.id)
         pending = [target for target in targets if target.status == "pending"]
         if not pending:
@@ -1159,6 +1300,16 @@ class RequestCallService:
         target = await session.get(DealerCallTarget, job.request_target_id)
         if not campaign or not target:
             return
+        if campaign.status == "canceled":
+            logger.info(
+                "request-call finalization skipped: campaign canceled",
+                extra={"job_id": job.id, "campaign_id": campaign.id, "target_id": target.id},
+            )
+            if job.status not in REQUEST_JOB_TERMINAL_STATUSES:
+                job.status = "canceled"
+                job.call_status = "canceled"
+                await session.commit()
+            return
         existing_report = await self._latest_target_report(
             session=session,
             campaign_id=campaign.id,
@@ -1211,6 +1362,16 @@ class RequestCallService:
         campaign = await session.get(RequestCallCampaign, job.request_campaign_id)
         target = await session.get(DealerCallTarget, job.request_target_id)
         if not campaign or not target:
+            return
+        if campaign.status == "canceled":
+            logger.info(
+                "request-call status finalization skipped: campaign canceled",
+                extra={"job_id": job.id, "campaign_id": campaign.id, "target_id": target.id, "call_status": call_status},
+            )
+            if job.status not in REQUEST_JOB_TERMINAL_STATUSES:
+                job.status = "canceled"
+                job.call_status = "canceled"
+                await session.commit()
             return
         existing_report = await self._latest_target_report(
             session=session,
@@ -1380,13 +1541,23 @@ class RequestCallService:
         report = reports[-1] if reports else None
         if not report:
             return False
-        report_html = build_request_target_report_html(target, report)
+        if campaign.status == "canceled":
+            logger.info(
+                "request-call report skipped: campaign canceled",
+                extra={"campaign_id": campaign.id, "target_id": target.id},
+            )
+            return False
+        report_html = build_request_target_report_html(target, report, campaign=campaign)
         targets = await self.list_targets(session, campaign.id)
         remaining = any(row.status == "pending" for row in targets)
         if job is not None:
             await self._send_request_call_audio(campaign=campaign, target=target, job=job, bot=bot)
         sent = await safe_send_message(bot, campaign.telegram_chat_id, report_html, parse_mode="HTML")
         success = bool(sent)
+        await session.refresh(campaign)
+        if campaign.status == "canceled":
+            await self._mark_report_delivery(session=session, job=job, success=success)
+            return success
         if remaining and success:
             if (campaign.call_sequence_mode or "manual") == "auto":
                 await self.send_service_message(
@@ -1456,6 +1627,9 @@ class RequestCallService:
         return bool(sent)
 
     async def send_campaign_summary(self, *, session: AsyncSession, campaign: RequestCallCampaign, bot: Bot) -> bool:
+        await session.refresh(campaign)
+        if campaign.status == "canceled":
+            return False
         reports = await self.list_reports(session, campaign.id)
         targets = await self.list_targets(session, campaign.id)
         if not reports and targets:
@@ -1500,7 +1674,31 @@ def _vehicle_context_summary(contexts: list[dict[str, Any]]) -> str | None:
         title = _compact_value(context.get("vehicle_title"), limit=90)
         if title:
             parts.append(title)
-        for label, key in (("VIN", "vin"), ("stock", "stock_number"), ("цена", "price"), ("цвет", "color")):
+        if not title:
+            make_model = _compact_value(
+                " ".join(
+                    part
+                    for part in (
+                        context.get("year"),
+                        context.get("make"),
+                        context.get("model"),
+                        context.get("trim"),
+                    )
+                    if part
+                ),
+                limit=90,
+            )
+            if make_model:
+                parts.append(make_model)
+        for label, key in (
+            ("цвет", "color"),
+            ("пробег", "mileage"),
+            ("цена", "price"),
+            ("VIN", "vin"),
+            ("stock", "stock_number"),
+            ("телефон дилера", "dealer_phone"),
+            ("адрес дилера", "dealer_address"),
+        ):
             value = _compact_value(context.get(key), limit=50)
             if value:
                 parts.append(f"{label}: {value}")

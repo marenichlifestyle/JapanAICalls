@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import re
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from app.bot.keyboards import (
-    call_confirm_keyboard,
     call_language_keyboard,
-    request_call_input_force_reply,
+    request_call_cancel_keyboard,
     request_call_confirm_keyboard,
     request_call_country_keyboard,
     request_call_language_keyboard,
@@ -20,11 +19,9 @@ from app.config import Settings
 from app.db import SessionLocal
 from app.repositories import (
     add_job_error,
-    create_job,
-    find_duplicate_listing_job,
     get_job,
     get_latest_input_request_campaign,
-    get_latest_input_request_campaign_in_chat,
+    get_latest_open_request_campaign,
     get_request_campaign,
 )
 from app.services.elevenlabs_client import ElevenLabsService
@@ -38,17 +35,7 @@ from app.services.telegram_delivery import safe_delete_message, safe_send_messag
 from app.services.workflow import CallWorkflow
 
 logger = logging.getLogger(__name__)
-CARSENSOR_URL_RE = re.compile(r"https?://(?:www\.)?carsensor\.net/usedcar/detail/[\w\-/?=&%\.]+")
-CARS_COM_URL_RE = re.compile(r"https?://(?:www\.)?cars\.com/vehicledetail/[\w\-/?=&%\.]+")
 REQUEST_START_STATUSES = {"ready_to_confirm", "ready_to_call"}
-GROUP_TEXT_ADOPTABLE_CAMPAIGN_STATUSES = {
-    "draft",
-    "needs_country",
-    "needs_phones",
-    "needs_goal",
-    "needs_phones_and_goal",
-    "needs_goal_clarification",
-}
 COUNTRY_LANGUAGE_BY_REGION = {"US": "en", "JP": "ja"}
 REQUEST_CALL_INSTRUCTIONS = (
     "Пришлите список дилеров с телефонами, задачу прозвона и при необходимости ссылки на авто "
@@ -66,6 +53,7 @@ def detect_source(url: str) -> str:
     if "cars.com/vehicledetail/" in url:
         return "cars.com"
     return "carsensor"
+
 
 def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> Router:
     router = Router()
@@ -131,11 +119,107 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
         await callback.answer("Эту кампанию начал другой админ", show_alert=True)
         return False
 
+    def telegram_display_name(user) -> str | None:
+        if user is None:
+            return None
+        parts = [getattr(user, "first_name", None), getattr(user, "last_name", None)]
+        display = " ".join(part for part in parts if part).strip()
+        return display or getattr(user, "username", None)
+
+    def telegram_username(user) -> str | None:
+        return getattr(user, "username", None) if user is not None else None
+
+    async def delete_later(bot, chat_id: int, message_id: int, delay_seconds: float = 5.0) -> None:
+        await asyncio.sleep(delay_seconds)
+        await safe_delete_message(bot, chat_id, message_id)
+
+    async def create_request_session(
+        *,
+        bot,
+        chat_id: int,
+        user,
+        source_message_id: int | None = None,
+    ):
+        async with SessionLocal() as session:
+            running_campaign = await request_service.get_running_campaign_for_owner(
+                session=session,
+                chat_id=chat_id,
+                user_id=user.id,
+            )
+            if running_campaign:
+                return None
+            await request_service.cancel_input_campaigns_for_owner(
+                session=session,
+                chat_id=chat_id,
+                user_id=user.id,
+                bot=bot,
+            )
+            return await request_service.create_draft(
+                session=session,
+                chat_id=chat_id,
+                user_id=user.id,
+                username=telegram_username(user),
+                display_name=telegram_display_name(user),
+                source_message_id=source_message_id,
+                status="needs_country",
+            )
+
+    async def send_request_country_prompt(*, bot, campaign_id: int) -> None:
+        async with SessionLocal() as session:
+            campaign = await get_request_campaign(session, campaign_id)
+            if campaign:
+                await request_service.send_service_message(
+                    session=session,
+                    campaign=campaign,
+                    bot=bot,
+                    text="Выберите страну прозвона. Номера без кода страны буду интерпретировать по выбранной стране.",
+                    reply_markup=request_call_country_keyboard(campaign.id),
+                )
+
     @router.message(Command("start"))
     async def start(message: Message) -> None:
         if not can_access_message(message):
             return
         await send_start_menu(message)
+
+    @router.message(Command("request"))
+    async def request_command(message: Message) -> None:
+        if not can_access_message(message):
+            return
+        campaign = await create_request_session(
+            bot=message.bot,
+            chat_id=message.chat.id,
+            user=message.from_user,
+            source_message_id=message.message_id,
+        )
+        if campaign is None:
+            await safe_send_message(
+                message.bot,
+                message.chat.id,
+                "У вас уже есть активный прозвон. Завершите или отмените его через /cancel.",
+            )
+            return
+        await send_request_country_prompt(bot=message.bot, campaign_id=campaign.id)
+
+    @router.message(Command("cancel"))
+    async def cancel_request_campaign_command(message: Message) -> None:
+        if not can_access_message(message):
+            return
+        async with SessionLocal() as session:
+            campaign = await get_latest_open_request_campaign(
+                session,
+                chat_id=message.chat.id,
+                user_id=message.from_user.id,
+            )
+            if not campaign:
+                sent = await safe_send_message(message.bot, message.chat.id, "Нет активной задачи для отмены.")
+                if sent:
+                    asyncio.create_task(delete_later(message.bot, message.chat.id, sent.message_id))
+                return
+            await request_service.cancel_campaign(session=session, campaign=campaign, bot=message.bot)
+        sent = await safe_send_message(message.bot, message.chat.id, "Задача отменена.")
+        if sent:
+            asyncio.create_task(delete_later(message.bot, message.chat.id, sent.message_id))
 
     @router.callback_query(F.data == "mode:link")
     async def select_link_mode(callback: CallbackQuery) -> None:
@@ -151,26 +235,21 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
         if not can_access_callback(callback):
             await callback.answer("Доступ запрещён", show_alert=True)
             return
-        async with SessionLocal() as session:
-            campaign = await request_service.create_draft(
-                session=session,
-                chat_id=callback.message.chat.id if callback.message else callback.from_user.id,
-                user_id=callback.from_user.id,
-                source_message_id=None,
-                status="needs_country",
+        chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+        campaign = await create_request_session(
+            bot=callback.bot,
+            chat_id=chat_id,
+            user=callback.from_user,
+        )
+        if campaign is None:
+            await callback.answer(
+                "У вас уже есть активный прозвон. Завершите или отмените его через /cancel.",
+                show_alert=True,
             )
+            return
         await callback.answer()
         await delete_callback_message(callback)
-        async with SessionLocal() as session:
-            campaign = await get_request_campaign(session, campaign.id)
-            if campaign:
-                await request_service.send_service_message(
-                    session=session,
-                    campaign=campaign,
-                    bot=callback.bot,
-                    text="Выберите страну прозвона. Номера без кода страны буду интерпретировать по выбранной стране.",
-                    reply_markup=request_call_country_keyboard(campaign.id),
-                )
+        await send_request_country_prompt(bot=callback.bot, campaign_id=campaign.id)
 
     @router.callback_query(F.data.startswith("request:country_soon:"))
     async def request_country_soon(callback: CallbackQuery) -> None:
@@ -214,7 +293,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 campaign=campaign,
                 bot=callback.bot,
                 text=f"Страна прозвона: {label}.\n\n{REQUEST_CALL_INSTRUCTIONS}",
-                reply_markup=request_call_input_force_reply(),
+                reply_markup=request_call_cancel_keyboard(campaign.id),
             )
 
     @router.message(F.text)
@@ -229,27 +308,14 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 chat_id=message.chat.id,
                 user_id=message.from_user.id,
             )
-            if campaign is None and message.chat.type in {"group", "supergroup"}:
-                campaign = await get_latest_input_request_campaign_in_chat(
-                    session,
-                    chat_id=message.chat.id,
-                )
-                if campaign and campaign.status not in GROUP_TEXT_ADOPTABLE_CAMPAIGN_STATUSES:
-                    campaign = None
-                elif campaign and campaign.telegram_user_id != message.from_user.id:
-                    logger.info(
-                        "request-call group input campaign adopted by admin",
-                        extra={
-                            "campaign_id": campaign.id,
-                            "chat_id": message.chat.id,
-                            "previous_user_id": campaign.telegram_user_id,
-                            "new_user_id": message.from_user.id,
-                            "status": campaign.status,
-                        },
-                    )
-                    campaign.telegram_user_id = message.from_user.id
-                    await session.commit()
             if campaign:
+                await request_service.update_campaign_owner(
+                    session=session,
+                    campaign=campaign,
+                    user_id=message.from_user.id,
+                    username=telegram_username(message.from_user),
+                    display_name=telegram_display_name(message.from_user),
+                )
                 processing_message = await message.answer(REQUEST_CALL_PROCESSING_MESSAGE)
                 try:
                     campaign = await request_service.update_campaign_from_text(
@@ -260,7 +326,13 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                     )
                     targets = await request_service.list_targets(session, campaign.id)
                     if campaign.status == "mixed_phone_regions":
-                        region_label = "США" if campaign.phone_region == "US" else "Япония" if campaign.phone_region == "JP" else "выбранной стране"
+                        region_label = (
+                            "США"
+                            if campaign.phone_region == "US"
+                            else "Япония"
+                            if campaign.phone_region == "JP"
+                            else "выбранной стране"
+                        )
                         await request_service.send_service_message(
                             session=session,
                             campaign=campaign,
@@ -270,7 +342,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                                 f"Сейчас выбрана страна: {region_label}. Пришлите номера только для этой страны "
                                 "или начните отдельную кампанию."
                             ),
-                            reply_markup=request_call_input_force_reply(),
+                            reply_markup=request_call_cancel_keyboard(campaign.id),
                         )
                     elif campaign.status == "needs_country":
                         await request_service.send_service_message(
@@ -289,7 +361,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Цель понял, но не нашёл номера телефонов. Пришлите список дилеров с телефонами.",
-                            reply_markup=request_call_input_force_reply(),
+                            reply_markup=request_call_cancel_keyboard(campaign.id),
                         )
                     elif campaign.status == "needs_goal":
                         await request_service.send_service_message(
@@ -297,7 +369,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Номера нашёл. Теперь пришлите задачу прозвона: что именно нужно выяснить у дилеров?",
-                            reply_markup=request_call_input_force_reply(),
+                            reply_markup=request_call_cancel_keyboard(campaign.id),
                         )
                     elif campaign.status == "needs_phones_and_goal":
                         await request_service.send_service_message(
@@ -305,7 +377,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Пришлите список дилеров с телефонами и задачу прозвона одним сообщением.",
-                            reply_markup=request_call_input_force_reply(),
+                            reply_markup=request_call_cancel_keyboard(campaign.id),
                         )
                     elif campaign.status == "needs_goal_clarification":
                         await request_service.send_service_message(
@@ -313,7 +385,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                             campaign=campaign,
                             bot=message.bot,
                             text="Уточните, пожалуйста, какую модель или задачу прозванивать и что обязательно выяснить?",
-                            reply_markup=request_call_input_force_reply(),
+                            reply_markup=request_call_cancel_keyboard(campaign.id),
                         )
                     elif campaign.status == "needs_language":
                         recommended = "ja" if campaign.phone_region == "JP" else "en"
@@ -338,38 +410,28 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 finally:
                     await safe_delete_message(message.bot, message.chat.id, processing_message.message_id)
                 return
-
-        match = CARSENSOR_URL_RE.search(text) or CARS_COM_URL_RE.search(text)
-        if not match:
-            await send_start_menu(message)
-            return
-
-        url = match.group(0)
-        source = detect_source(url)
-
-        async with SessionLocal() as session:
-            duplicate = await find_duplicate_listing_job(session, listing_url=url)
-            if duplicate:
-                await message.answer(
-                    "По этой машине уже звонили или звонок уже запланирован:\n"
-                    f"Job #{duplicate.id}, статус: {duplicate.status}, дата: {duplicate.created_at:%Y-%m-%d %H:%M}"
-                )
-                return
-            job = await create_job(
-                session,
+            running_campaign = await request_service.get_running_campaign_for_owner(
+                session=session,
                 chat_id=message.chat.id,
                 user_id=message.from_user.id,
-                source_message_id=message.message_id,
-                source=source,
-                listing_url=url,
-                status="pending_confirmation",
             )
-        logger.info("Received listing URL", extra={"job_id": job.id, "url": url})
+            if running_campaign:
+                logger.info(
+                    "request-call ignored text while campaign is not accepting free-form input",
+                    extra={
+                        "campaign_id": running_campaign.id,
+                        "chat_id": message.chat.id,
+                        "user_id": message.from_user.id,
+                        "status": running_campaign.status,
+                    },
+                )
+                return
 
-        await message.answer(
-            f"Получена ссылка: {url}\nJob #{job.id}",
-            reply_markup=call_confirm_keyboard(job.id),
+        logger.info(
+            "request-call ignored inactive text",
+            extra={"chat_id": message.chat.id, "user_id": message.from_user.id, "chat_type": message.chat.type},
         )
+        return
 
     @router.callback_query(F.data.startswith("cancel:"))
     async def cancel_call(callback: CallbackQuery) -> None:
@@ -674,11 +736,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 return
             if not await ensure_request_campaign_owner(callback, campaign):
                 return
-            campaign.status = "stopped"
-            await session.commit()
-            await request_service.cleanup_service_messages(session=session, campaign=campaign, bot=callback.bot)
-        if callback.message:
-            await callback.message.answer("Кампания остановлена. Новые звонки создаваться не будут.")
+            await request_service.cancel_campaign(session=session, campaign=campaign, bot=callback.bot)
         await callback.answer("Остановлено")
 
     @router.callback_query(F.data.startswith("request:change_goal:"))
@@ -696,9 +754,14 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
                 return
             campaign.status = "needs_goal"
             await session.commit()
-        if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.answer("Пришлите новую задачу прозвона: что именно нужно выяснить у дилеров?")
+            if callback.message:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            await request_service.send_service_message(
+                session=session,
+                campaign=campaign,
+                bot=callback.bot,
+                text="Пришлите новую задачу прозвона: что именно нужно выяснить у дилеров?",
+            )
         await callback.answer("Жду новую цель")
 
     @router.callback_query(F.data.startswith("request:cancel:"))
@@ -712,9 +775,7 @@ def create_router(settings: Settings, workflow: CallWorkflow | None = None) -> R
             if campaign:
                 if not await ensure_request_campaign_owner(callback, campaign):
                     return
-                campaign.status = "stopped"
-                await session.commit()
-                await request_service.cleanup_service_messages(session=session, campaign=campaign, bot=callback.bot)
-        await callback.answer("Отменено")
+                await request_service.cancel_campaign(session=session, campaign=campaign, bot=callback.bot)
+        await callback.answer("Задача отменена")
 
     return router

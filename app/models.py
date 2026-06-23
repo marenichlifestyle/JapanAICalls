@@ -212,6 +212,8 @@ class RequestCallCampaign(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     telegram_chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    telegram_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    telegram_user_display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     telegram_source_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     telegram_service_message_ids: Mapped[list[int] | None] = mapped_column(JSON, nullable=True)
     mode: Mapped[str] = mapped_column(String(32), default="request_call")

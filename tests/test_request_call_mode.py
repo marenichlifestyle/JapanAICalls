@@ -11,7 +11,7 @@ from app.models import Base, CallReport, Job
 from app.repositories import (
     create_request_campaign,
     get_latest_input_request_campaign,
-    get_latest_input_request_campaign_in_chat,
+    get_latest_open_request_campaign,
 )
 from app.schemas import GoalGenerationResult, RequestCallReportResult
 from app.services.elevenlabs_client import ElevenLabsService
@@ -377,9 +377,13 @@ async def test_create_draft_accepts_initial_status_for_country_flow() -> None:
             chat_id=10,
             user_id=1,
             status="needs_country",
+            username="owner_name",
+            display_name="Owner Admin",
         )
         assert campaign.status == "needs_country"
         assert campaign.call_sequence_mode == "manual"
+        assert campaign.telegram_username == "owner_name"
+        assert campaign.telegram_user_display_name == "Owner Admin"
     await engine.dispose()
 
 
@@ -466,7 +470,7 @@ def test_ram_trx_goal_is_not_treated_as_vague() -> None:
     assert "price" in (fallback.goal_ru or "").lower()
 
 
-def test_goal_clarification_from_llm_falls_back_for_clear_goal() -> None:
+def test_goal_clarification_from_llm_is_respected() -> None:
     result = RequestCallService._ensure_compact_goal(
         SimpleNamespace(dealer_name="O'Daniel Chrysler Dodge Jeep Ram", campaign_id=1, id=1),
         "RAM TRX SRT 2026 Когда можно будет заказать? какой ценник?",
@@ -474,11 +478,8 @@ def test_goal_clarification_from_llm_falls_back_for_clear_goal() -> None:
         call_language="en",
         vehicle_context=[],
     )
-    assert result.status == "ready"
-    assert result.goal_ru
-    assert "RAM TRX SRT 2026" in result.goal_ru
-    assert "Jeep dealership" not in result.goal_ru
-    assert "RAM dealership" not in result.goal_ru
+    assert result.status == "needs_goal_clarification"
+    assert result.goal_ru is None
 
 
 @pytest.mark.asyncio
@@ -500,6 +501,8 @@ async def test_goal_generation_prompt_requires_follow_up_questions() -> None:
     assert "never copy or mention the exact dealer_name" in openai.last_prompt
     assert "do not use brand-specific dealer labels" in openai.last_prompt
     assert "a <brand> dealership" in openai.last_prompt
+    assert "Do not normalize or correct vehicle brand/model names" in openai.last_prompt
+    assert "vehicle_context identifies the vehicle" in openai.last_prompt
     assert "Call the sales department about" in openai.last_prompt
     assert "availability or incoming ETA" in openai.last_prompt
     assert "keep the call natural" in openai.last_prompt
@@ -518,6 +521,8 @@ async def test_request_report_prompt_marks_missing_required_answers() -> None:
     )
     assert "goal_ru и transcript могут быть на английском или японском" in openai.last_prompt
     assert "Все человекочитаемые поля отчёта верни на русском" in openai.last_prompt
+    assert "Строй отчёт исходя из goal_ru" in openai.last_prompt
+    assert "закрыт" in openai.last_prompt
     assert "not_answered" in openai.last_prompt
     assert "поставка есть, но срок не получен" in openai.last_prompt
     assert "ai_quality_score" in openai.last_prompt
@@ -686,6 +691,11 @@ def test_settings_admin_ids_parse_new_allowed_users() -> None:
 
 def test_request_target_report_html_is_escaped_and_compact() -> None:
     target = SimpleNamespace(dealer_name="A&B Ford <Sales>", phone_e164="+19043876541")
+    campaign = SimpleNamespace(
+        telegram_user_id=929466979,
+        telegram_username="owner_name",
+        telegram_user_display_name="Owner <Admin>",
+    )
     report = SimpleNamespace(
         call_status="completed",
         ai_quality_score=87,
@@ -701,14 +711,43 @@ def test_request_target_report_html_is_escaped_and_compact() -> None:
         next_action="написать менеджеру",
         important_notes="not_answered",
     )
-    html = build_request_target_report_html(target, report)
+    html = build_request_target_report_html(target, report, campaign=campaign)
 
     assert "<b>Отчёт: A&amp;B Ford &lt;Sales&gt;</b>" in html
+    assert "<b>Поставил задачу:</b> @owner_name" in html
     assert "<b>Номер:</b> <code>+19043876541</code>" in html
     assert "<b>Оценка AI:</b> <code>87/100</code> (получил цену &lt;VIN не спросил&gt;)" in html
     assert "not_answered" not in html
     assert "Конфигурация" not in html
     assert "Оплата/документы" in html
+
+
+def test_request_target_report_mentions_owner_by_tg_link_without_username() -> None:
+    target = SimpleNamespace(dealer_name="Dealer", phone_e164="+19043876541")
+    campaign = SimpleNamespace(
+        telegram_user_id=1560959066,
+        telegram_username=None,
+        telegram_user_display_name="Alex <Admin>",
+    )
+    report = SimpleNamespace(
+        call_status="completed",
+        ai_quality_score=None,
+        ai_quality_reason=None,
+        summary="Итог",
+        availability_result="not_answered",
+        incoming_result="not_answered",
+        price_result="not_answered",
+        configuration_result="not_answered",
+        vin_or_stock_result="not_answered",
+        payment_result="not_answered",
+        paperwork_result="not_answered",
+        next_action="not_answered",
+        important_notes="not_answered",
+    )
+
+    html = build_request_target_report_html(target, report, campaign=campaign)
+
+    assert '<a href="tg://user?id=1560959066">Alex &lt;Admin&gt;</a>' in html
 
 
 def test_request_campaign_summary_shows_all_useful_results_without_top_three_cap() -> None:
@@ -795,18 +834,95 @@ async def test_latest_input_campaign_ignores_completed_and_waiting_next_states()
 
 
 @pytest.mark.asyncio
-async def test_latest_input_campaign_can_be_found_by_group_chat() -> None:
+async def test_latest_input_campaign_is_owner_scoped_in_group_chat() -> None:
     engine, session_maker = await _session_maker()
     async with session_maker() as session:
         await create_request_campaign(session, chat_id=-1005288422605, user_id=1, status="completed")
         draft = await create_request_campaign(session, chat_id=-1005288422605, user_id=1, status="draft")
 
         assert await get_latest_input_request_campaign(session, chat_id=-1005288422605, user_id=2) is None
-        assert (await get_latest_input_request_campaign_in_chat(session, chat_id=-1005288422605)).id == draft.id
+        assert (await get_latest_input_request_campaign(session, chat_id=-1005288422605, user_id=1)).id == draft.id
 
         draft.status = "needs_phones_and_goal"
         await session.commit()
-        assert (await get_latest_input_request_campaign_in_chat(session, chat_id=-1005288422605)).id == draft.id
+        assert await get_latest_input_request_campaign(session, chat_id=-1005288422605, user_id=2) is None
+        assert (await get_latest_input_request_campaign(session, chat_id=-1005288422605, user_id=1)).id == draft.id
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_call_new_session_cancels_stale_input_campaigns() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    bot = FakeBot()
+    async with session_maker() as session:
+        stale = await service.create_draft(session=session, chat_id=10, user_id=1, status="needs_goal")
+        service_message = await service.send_service_message(
+            session=session,
+            campaign=stale,
+            bot=bot,
+            text="old prompt",
+        )
+        running = await service.create_draft(session=session, chat_id=10, user_id=2, status="waiting_next")
+
+        canceled_count = await service.cancel_input_campaigns_for_owner(
+            session=session,
+            chat_id=10,
+            user_id=1,
+            bot=bot,
+        )
+        await session.refresh(stale)
+        await session.refresh(running)
+
+        assert canceled_count == 1
+        assert stale.status == "canceled"
+        assert stale.telegram_service_message_ids == []
+        assert running.status == "waiting_next"
+        assert service_message is not None
+        assert (10, service_message.message_id) in bot.deleted_messages
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_call_running_campaign_blocks_new_session_for_owner() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    async with session_maker() as session:
+        running = await service.create_draft(session=session, chat_id=10, user_id=1, status="waiting_call_result")
+        await service.create_draft(session=session, chat_id=10, user_id=2, status="waiting_next")
+
+        found = await service.get_running_campaign_for_owner(session=session, chat_id=10, user_id=1)
+
+        assert found is not None
+        assert found.id == running.id
+        assert await service.get_running_campaign_for_owner(session=session, chat_id=10, user_id=3) is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_latest_open_campaign_for_cancel_is_owner_scoped_in_group() -> None:
+    engine, session_maker = await _session_maker()
+    async with session_maker() as session:
+        await create_request_campaign(session, chat_id=-1005288422605, user_id=1, status="completed")
+        owner_campaign = await create_request_campaign(session, chat_id=-1005288422605, user_id=1, status="waiting_next")
+        await create_request_campaign(session, chat_id=-1005288422605, user_id=2, status="calling")
+
+        assert (await get_latest_open_request_campaign(session, chat_id=-1005288422605, user_id=1)).id == owner_campaign.id
+        assert await get_latest_open_request_campaign(session, chat_id=-1005288422605, user_id=3) is None
+
+        owner_campaign.status = "canceled"
+        await session.commit()
+        assert await get_latest_open_request_campaign(session, chat_id=-1005288422605, user_id=1) is None
     await engine.dispose()
 
 
@@ -844,7 +960,7 @@ async def test_request_campaign_uses_url_context_in_confirmation() -> None:
             text=(
                 "Duval Ford Jacksonville +1 (904) 387-6541\n"
                 "https://example.com/raptor-r\n"
-                "Задача: узнать наличие Ford Raptor R из наличия или ближайшей поставки."
+                "Задача: узнать наличие и цену."
             ),
         )
         assert campaign.status == "ready_to_confirm"
@@ -860,6 +976,8 @@ async def test_request_campaign_uses_url_context_in_confirmation() -> None:
         assert "Контекст из ссылок:" in text
         assert "2024 Ford Raptor R" in text
         assert "VIN: 1FTFW1RG0RF000001" in text
+        assert "цвет: Shelter Green" in text
+        assert "цена: $112,000" in text
     await engine.dispose()
 
 
@@ -1097,6 +1215,107 @@ async def test_request_call_cleans_service_messages_after_campaign_completion() 
         assert (10, 999) in bot.deleted_messages
         assert campaign.telegram_service_message_ids == []
         assert job.telegram_service_message_ids == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_call_cancel_campaign_marks_state_and_cleans_messages() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    bot = FakeBot()
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="Duval Ford Jacksonville +1 (904) 387-6541\nЗадача: узнать наличие Ford Raptor R.",
+        )
+        targets = await service.list_targets(session, campaign.id)
+        service_message = await service.send_service_message(
+            session=session,
+            campaign=campaign,
+            bot=bot,
+            text="служебное сообщение",
+        )
+        job = Job(
+            telegram_chat_id=10,
+            telegram_user_id=1,
+            listing_url=f"request-call://campaign/{campaign.id}/target/{targets[0].id}",
+            source="request_call",
+            request_campaign_id=campaign.id,
+            request_target_id=targets[0].id,
+            telegram_service_message_ids=[999],
+            status="waiting_call_result",
+        )
+        session.add(job)
+        await session.commit()
+
+        await service.cancel_campaign(session=session, campaign=campaign, bot=bot)
+        await session.refresh(campaign)
+        await session.refresh(targets[0])
+        await session.refresh(job)
+
+        assert service_message is not None
+        assert campaign.status == "canceled"
+        assert targets[0].status == "canceled"
+        assert job.status == "canceled"
+        assert campaign.telegram_service_message_ids == []
+        assert job.telegram_service_message_ids == []
+        assert (10, service_message.message_id) in bot.deleted_messages
+        assert (10, 999) in bot.deleted_messages
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_late_request_call_finalization_is_ignored_after_cancel() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    bot = FakeBot()
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="Duval Ford Jacksonville +1 (904) 387-6541\nЗадача: узнать наличие Ford Raptor R.",
+        )
+        targets = await service.list_targets(session, campaign.id)
+        job = Job(
+            telegram_chat_id=10,
+            telegram_user_id=1,
+            listing_url=f"request-call://campaign/{campaign.id}/target/{targets[0].id}",
+            source="request_call",
+            request_campaign_id=campaign.id,
+            request_target_id=targets[0].id,
+            request_goal_ru=targets[0].goal_ru,
+            status="waiting_call_result",
+        )
+        session.add(job)
+        await session.commit()
+
+        await service.cancel_campaign(session=session, campaign=campaign, bot=bot)
+        await service.finalize_job_from_transcript(
+            session=session,
+            job=job,
+            bot=bot,
+            transcript="agent: hello\nuser: answered",
+            summary="completed",
+        )
+
+        reports = (await session.execute(select(CallReport).where(CallReport.campaign_id == campaign.id))).scalars().all()
+        assert reports == []
+        assert not any("Отчёт:" in row["text"] for row in bot.messages)
     await engine.dispose()
 
 
