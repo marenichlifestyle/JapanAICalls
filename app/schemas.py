@@ -85,6 +85,21 @@ class GoalGenerationResult(BaseModel):
     clarification_questions: list[str] = Field(default_factory=list)
 
 
+class RequestCallGoalAnswer(BaseModel):
+    question: str
+    answer: str | None = None
+    status: str
+    reason: str | None = None
+    evidence: str | None = None
+    result_marker: str | None = None
+
+
+class RequestCallContactDetail(BaseModel):
+    type: str
+    value: str
+    purpose: str | None = None
+
+
 class RequestCallReportResult(BaseModel):
     call_status: str
     reached_sales: bool | None = None
@@ -99,6 +114,10 @@ class RequestCallReportResult(BaseModel):
     paperwork_result: str | None = None
     important_notes: str | None = None
     next_action: str | None = None
+    goal_answers: list[RequestCallGoalAnswer] = Field(default_factory=list)
+    critical_missing: list[str] = Field(default_factory=list)
+    commitments: list[str] = Field(default_factory=list)
+    contact_details: list[RequestCallContactDetail] = Field(default_factory=list)
     ai_quality_score: int | None = Field(default=None, ge=1, le=100)
     ai_quality_reason: str | None = None
 

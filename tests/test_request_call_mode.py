@@ -133,6 +133,23 @@ class FakeOpenAI(OpenAIService):
             paperwork_result="not_answered",
             important_notes="попросили написать email",
             next_action="написать дилеру",
+            goal_answers=[
+                {
+                    "question": "Наличие автомобиля",
+                    "answer": "есть ближайшая поставка",
+                    "status": "answered",
+                    "reason": "продавец подтвердил incoming unit",
+                    "evidence": "incoming unit is possible",
+                    "result_marker": "green",
+                }
+            ],
+            critical_missing=[],
+            commitments=["Менеджер уточнит детали и вернётся с ответом."],
+            contact_details=[
+                {"type": "phone", "value": "+17867060777", "purpose": "обратный звонок"},
+                {"type": "whatsapp", "value": "+17867060777", "purpose": "WhatsApp доступен"},
+                {"type": "email", "value": "b4484298@gmail.com", "purpose": "ответ по email"},
+            ],
             ai_quality_score=88,
             ai_quality_reason="агент получил ключевые ответы",
         )
@@ -537,11 +554,32 @@ async def test_request_report_prompt_marks_missing_required_answers() -> None:
     settings = _settings()
     openai = CapturingOpenAI(settings)
     await openai.extract_request_call_report(
-        transcript="agent: Is it incoming?\nuser: yes",
-        goal_ru="Mandatory questions: ETA, price, VIN.",
+        transcript=(
+            "agent: Is it incoming and what color is it?\n"
+            "user: It is red, but I do not know the ETA.\n"
+            "user: Eric will check with the sales manager and call back.\n"
+            "agent: You can reach me at +1 786 706 0777 or b four four eight four two nine eight at gmail dot com."
+        ),
+        goal_ru="Mandatory questions: ETA, price, VIN, color, best next contact.",
     )
     assert "goal_ru и transcript могут быть на английском или японском" in openai.last_prompt
     assert "Все человекочитаемые поля отчёта верни на русском" in openai.last_prompt
+    assert "Сначала выдели из goal_ru короткий чеклист" in openai.last_prompt
+    assert "сопоставь каждый пункт чеклиста с transcript" in openai.last_prompt
+    assert "goal_answers" in openai.last_prompt
+    assert "critical_missing" in openai.last_prompt
+    assert "reason" in openai.last_prompt
+    assert "result_marker" in openai.last_prompt
+    assert "green" in openai.last_prompt
+    assert "red" in openai.last_prompt
+    assert "yellow" in openai.last_prompt
+    assert "менеджер сказал, что уточнит" in openai.last_prompt
+    assert "commitments" in openai.last_prompt
+    assert "contact_details" in openai.last_prompt
+    assert "Eric уточнит у sales manager" in openai.last_prompt
+    assert "b four four eight" in openai.last_prompt
+    assert "Цвет автомобиля" in openai.last_prompt
+    assert "красный" in openai.last_prompt
     assert "Строй отчёт исходя из goal_ru" in openai.last_prompt
     assert "закрыт" in openai.last_prompt
     assert "not_answered" in openai.last_prompt
@@ -713,6 +751,32 @@ def test_request_target_report_html_is_escaped_and_compact() -> None:
         paperwork_result="not_answered",
         next_action="написать менеджеру",
         important_notes="not_answered",
+        raw_report_json={
+            "goal_answers": [
+                {
+                    "question": "Цвет автомобиля",
+                    "answer": "красный",
+                    "status": "answered",
+                    "reason": "продавец сказал red",
+                    "evidence": "seller said red",
+                    "result_marker": "green",
+                },
+                {
+                    "question": "Цена",
+                    "answer": "не получено",
+                    "status": "not_answered",
+                    "reason": "менеджер сказал, что уточнит у руководства",
+                    "evidence": None,
+                    "result_marker": "red",
+                },
+            ],
+            "critical_missing": ["цена"],
+            "commitments": ["Eric уточнит у sales manager и перезвонит."],
+            "contact_details": [
+                {"type": "phone", "value": "+17867060777", "purpose": "обратный звонок"},
+                {"type": "email", "value": "b4484298@gmail.com", "purpose": "ответ по email"},
+            ],
+        },
     )
     html = build_request_target_report_html(target, report, campaign=campaign)
 
@@ -720,6 +784,15 @@ def test_request_target_report_html_is_escaped_and_compact() -> None:
     assert "<b>Поставил задачу:</b> @owner_name" in html
     assert "<b>Номер:</b> <code>+19043876541</code>" in html
     assert "<b>Оценка AI:</b> <code>87/100</code> (получил цену &lt;VIN не спросил&gt;)" in html
+    assert "<b>Ответы по цели:</b>" in html
+    assert "✅ <b>Цвет автомобиля:</b> красный — продавец сказал red" in html
+    assert "❌ <b>Цена:</b> не получено — менеджер сказал, что уточнит у руководства" in html
+    assert "<b>Не закрыто:</b> цена" in html
+    assert "<b>Договорённости:</b>" in html
+    assert "Eric уточнит у sales manager и перезвонит." in html
+    assert "<b>Контакты/обратная связь:</b>" in html
+    assert "<b>телефон:</b> <code>+17867060777</code> — обратный звонок" in html
+    assert "<b>email:</b> <code>b4484298@gmail.com</code> — ответ по email" in html
     assert "not_answered" not in html
     assert "Конфигурация" not in html
     assert "Оплата/документы" in html
@@ -1036,8 +1109,21 @@ async def test_request_call_starts_one_call_with_goal_ru_only_and_waits_next() -
         report_message = next(row for row in bot.messages if "Отчёт:" in row["text"])
         assert report_message["kwargs"].get("parse_mode") == "HTML"
         assert report_message["kwargs"].get("reply_markup") is None
+        report_row = (
+            await session.execute(select(CallReport).where(CallReport.target_id == targets[0].id))
+        ).scalar_one()
+        assert report_row.raw_report_json["goal_answers"][0]["question"] == "Наличие автомобиля"
+        assert report_row.raw_report_json["contact_details"][0]["value"] == "+17867060777"
         assert "<b>Номер:</b> <code>+19043876541</code>" in report_text
         assert "<b>Оценка AI:</b> <code>88/100</code>" in report_text
+        assert "<b>Ответы по цели:</b>" in report_text
+        assert "✅ <b>Наличие автомобиля:</b> есть ближайшая поставка — продавец подтвердил incoming unit" in report_text
+        assert "<b>Договорённости:</b>" in report_text
+        assert "Менеджер уточнит детали и вернётся с ответом." in report_text
+        assert "<b>Контакты/обратная связь:</b>" in report_text
+        assert "<b>телефон:</b> <code>+17867060777</code> — обратный звонок" in report_text
+        assert "<b>WhatsApp:</b> <code>+17867060777</code> — WhatsApp доступен" in report_text
+        assert "<b>email:</b> <code>b4484298@gmail.com</code> — ответ по email" in report_text
         assert "агент получил ключевые ответы" in report_text
         assert "not_answered" not in report_text
         assert "VIN/stock" not in report_text

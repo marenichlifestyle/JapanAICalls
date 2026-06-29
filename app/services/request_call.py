@@ -373,6 +373,146 @@ def _html_value(value: str | None, *, limit: int = 260) -> str | None:
     return html.escape(compact) if compact else None
 
 
+def _goal_answer_status_label(status: str | None) -> str:
+    return {
+        "answered": "получено",
+        "not_answered": "не получено",
+        "unknown": "не знают",
+        "refused": "отказались отвечать",
+        "not_applicable": "не применимо",
+    }.get((status or "").strip(), "не получено")
+
+
+def _goal_answer_marker(item: dict) -> str:
+    marker = str(item.get("result_marker") or "").strip().lower()
+    if marker == "green":
+        return "✅"
+    if marker == "yellow":
+        return "⚠️"
+    if marker == "red":
+        return "❌"
+    status = str(item.get("status") or "").strip().lower()
+    if status == "answered":
+        return "✅"
+    if status in {"unknown", "not_applicable"}:
+        return "⚠️"
+    return "❌"
+
+
+def _raw_goal_answer_value(value: object, *, limit: int = 180) -> str | None:
+    cleaned = _clean_spaces(str(value or ""))
+    if cleaned.lower() in {"", "null", "none", "—", "-"}:
+        return None
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _goal_answer_lines(report: CallReport, *, limit: int = 8) -> list[str]:
+    raw = getattr(report, "raw_report_json", None) or {}
+    answers = raw.get("goal_answers") if isinstance(raw, dict) else None
+    if not isinstance(answers, list):
+        return []
+    lines: list[str] = []
+    for item in answers:
+        if not isinstance(item, dict):
+            continue
+        question = _raw_goal_answer_value(item.get("question"), limit=90)
+        if not question:
+            continue
+        status = str(item.get("status") or "not_answered").strip()
+        answer = _raw_goal_answer_value(item.get("answer"), limit=180)
+        if status != "answered" and not answer:
+            answer = _goal_answer_status_label(status)
+        elif answer and status != "answered" and answer.lower() not in {"не получено", "not_answered"}:
+            answer = f"{answer} ({_goal_answer_status_label(status)})"
+        elif not answer:
+            answer = "не получено"
+        marker = _goal_answer_marker(item)
+        reason = _raw_goal_answer_value(item.get("reason"), limit=140)
+        suffix = f" — {html.escape(reason)}" if reason else ""
+        lines.append(f"{marker} <b>{html.escape(question)}:</b> {html.escape(answer)}{suffix}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _critical_missing_lines(report: CallReport, *, limit: int = 6) -> list[str]:
+    raw = getattr(report, "raw_report_json", None) or {}
+    missing = raw.get("critical_missing") if isinstance(raw, dict) else None
+    if not isinstance(missing, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in missing:
+        text = _raw_goal_answer_value(item, limit=100)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(html.escape(text))
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _commitment_lines(report: CallReport, *, limit: int = 4) -> list[str]:
+    raw = getattr(report, "raw_report_json", None) or {}
+    commitments = raw.get("commitments") if isinstance(raw, dict) else None
+    if not isinstance(commitments, list):
+        return []
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in commitments:
+        text = _raw_goal_answer_value(item, limit=180)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"• {html.escape(text)}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _contact_detail_lines(report: CallReport, *, limit: int = 5) -> list[str]:
+    raw = getattr(report, "raw_report_json", None) or {}
+    contacts = raw.get("contact_details") if isinstance(raw, dict) else None
+    if not isinstance(contacts, list):
+        return []
+    labels = {
+        "phone": "телефон",
+        "email": "email",
+        "whatsapp": "WhatsApp",
+        "person": "контакт",
+        "other": "контакт",
+    }
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in contacts:
+        if not isinstance(item, dict):
+            continue
+        value = _raw_goal_answer_value(item.get("value"), limit=120)
+        if not value:
+            continue
+        contact_type = str(item.get("type") or "other").strip().lower()
+        purpose = _raw_goal_answer_value(item.get("purpose"), limit=120)
+        key = f"{contact_type}:{value}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        label = labels.get(contact_type, "контакт")
+        suffix = f" — {html.escape(purpose)}" if purpose else ""
+        lines.append(f"• <b>{html.escape(label)}:</b> <code>{html.escape(value)}</code>{suffix}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 def _report_has_useful_result(report: CallReport) -> bool:
     if (report.call_status or "") == "asked_to_message":
         return True
@@ -423,6 +563,21 @@ def build_request_target_report_html(
         reason = _html_value(report.ai_quality_reason, limit=180)
         suffix = f" ({reason})" if reason else ""
         lines.append(f"<b>Оценка AI:</b> <code>{report.ai_quality_score}/100</code>{suffix}")
+    goal_lines = _goal_answer_lines(report)
+    if goal_lines:
+        lines.append("<b>Ответы по цели:</b>")
+        lines.extend(goal_lines)
+    missing_lines = _critical_missing_lines(report)
+    if missing_lines:
+        lines.append(f"<b>Не закрыто:</b> {', '.join(missing_lines)}")
+    commitment_lines = _commitment_lines(report)
+    if commitment_lines:
+        lines.append("<b>Договорённости:</b>")
+        lines.extend(commitment_lines)
+    contact_lines = _contact_detail_lines(report)
+    if contact_lines:
+        lines.append("<b>Контакты/обратная связь:</b>")
+        lines.extend(contact_lines)
     fact_rows = (
         ("Итог", report.summary),
         ("Наличие/поставка", availability),

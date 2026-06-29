@@ -811,6 +811,10 @@ class OpenAIService:
                 "paperwork_result",
                 "important_notes",
                 "next_action",
+                "goal_answers",
+                "critical_missing",
+                "commitments",
+                "contact_details",
                 "ai_quality_score",
                 "ai_quality_reason",
             ],
@@ -828,6 +832,46 @@ class OpenAIService:
                 "paperwork_result": {"type": ["string", "null"]},
                 "important_notes": {"type": ["string", "null"]},
                 "next_action": {"type": ["string", "null"]},
+                "goal_answers": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["question", "answer", "status", "reason", "evidence", "result_marker"],
+                        "properties": {
+                            "question": {"type": "string"},
+                            "answer": {"type": ["string", "null"]},
+                            "status": {
+                                "type": "string",
+                                "enum": ["answered", "not_answered", "unknown", "refused", "not_applicable"],
+                            },
+                            "reason": {"type": ["string", "null"]},
+                            "evidence": {"type": ["string", "null"]},
+                            "result_marker": {"type": "string", "enum": ["green", "red", "yellow"]},
+                        },
+                    },
+                },
+                "critical_missing": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "commitments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "contact_details": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["type", "value", "purpose"],
+                        "properties": {
+                            "type": {"type": "string", "enum": ["phone", "email", "whatsapp", "person", "other"]},
+                            "value": {"type": "string"},
+                            "purpose": {"type": ["string", "null"]},
+                        },
+                    },
+                },
                 "ai_quality_score": {"type": ["integer", "null"], "minimum": 1, "maximum": 100},
                 "ai_quality_reason": {"type": ["string", "null"]},
             },
@@ -836,9 +880,34 @@ class OpenAIService:
             "Извлеки структурированный отчёт из звонка дилеру и верни строгий JSON.\n"
             "goal_ru и transcript могут быть на английском или японском языке, потому что request-call режим "
             "может прозванивать США или Японию.\n"
+            "Главное правило: отчёт строится от цели звонка. Сначала выдели из goal_ru короткий чеклист всех "
+            "конкретных вопросов/задач, которые агент должен был закрыть. Затем сопоставь каждый пункт чеклиста "
+            "с transcript и заполни goal_answers.\n"
+            "Для каждого goal_answers элемента:\n"
+            "- question: короткий пункт цели на русском, например 'Цвет автомобиля' или 'Возможность dealer-to-dealer покупки';\n"
+            "- answer: конкретный ответ на русском из transcript, например 'красный', '$70,399', 'dealer-to-dealer возможна';\n"
+            "- status: answered, если получен конкретный ответ; not_answered, если вопрос не задан или ответа нет; "
+            "unknown, если продавец сказал, что не знает; refused, если отказался отвечать; not_applicable, если пункт отпал по логике разговора;\n"
+            "- reason: коротко почему результат получен/не получен: ответили конкретно, менеджер не знает, обещал уточнить, связь прервалась, voicemail, отказ, ошибка провайдера;\n"
+            "- evidence: короткая цитата или пересказ фразы из transcript, подтверждающий answer; null, если подтверждения нет.\n"
+            "- result_marker: green если пункт цели закрыт конкретным ответом или полезной договорённостью; red если результата нет; "
+            "yellow если результат частичный и нужен follow-up.\n"
+            "Если в goal_ru было 'спросить цвет', а продавец сказал 'red', верни question='Цвет автомобиля', "
+            "answer='красный', status='answered', result_marker='green'. Если цель спрашивала цену, но менеджер сказал "
+            "'уточню и перезвоню', верни status='not_answered' или 'unknown', answer='не получена', "
+            "reason='менеджер сказал, что уточнит у руководства и вернётся с ответом', result_marker='red' или 'yellow' "
+            "и добавь 'цена' в critical_missing.\n"
+            "Отдельно обязательно извлекай follow-up договорённости и контакты из transcript, даже если они не входят "
+            "в старые поля отчёта. commitments: короткие факты о том, кто что обещал сделать, например "
+            "'Eric уточнит у sales manager и перезвонит'. contact_details: все явно названные телефоны, WhatsApp, "
+            "email, имена менеджеров или ответственных лиц. Нормализуй только явно произнесённые контакты: "
+            "например 'b four four eight...' можно записать как email, если адрес однозначен; не придумывай контакты.\n"
             "Все человекочитаемые поля отчёта верни на русском языке: summary, availability_result, "
             "incoming_result, price_result, configuration_result, vin_or_stock_result, payment_result, "
-            "paperwork_result, important_notes, next_action. Технические enum/status values оставь на английском.\n"
+            "paperwork_result, important_notes, next_action, goal_answers.question, goal_answers.answer, "
+            "goal_answers.reason, goal_answers.evidence, critical_missing, commitments, contact_details.purpose. "
+            "contact_details.value оставляй в исходном полезном формате: телефон как +1..., email как name@example.com. "
+            "Технические enum/status values оставь на английском.\n"
             "Пиши максимально точно и по делу: каждое человекочитаемое поле максимум 1 короткое предложение, "
             "без пересказа диалога, вводных фраз и воды. Итог должен сразу отвечать, чем закончился звонок. "
             "Если есть конкретная дата, цена, VIN/stock, имя контакта или next step — ставь их первыми. "
@@ -847,6 +916,7 @@ class OpenAIService:
             "Строй отчёт исходя из goal_ru, а не по универсальному шаблону: выдели именно те вопросы, которые "
             "были важны для цели звонка. Если вопрос из goal_ru закрыт, дай конкретный факт; если не закрыт, "
             "пометь not_answered в подходящем поле и кратко укажи пропуск в important_notes или next_action. "
+            "critical_missing должен содержать только важные пункты из goal_ru, которые не закрыты конкретным ответом. "
             "Если цель была про заказ/квоту/поставку, обязательно отрази ETA/квоту/заказ или что эти данные не получены. "
             "Если цель была про конкретный автомобиль из ссылки, обязательно отрази идентификаторы VIN/stock/цвет/цену, "
             "если они обсуждались.\n"
@@ -858,9 +928,9 @@ class OpenAIService:
             "call_status должен быть одним из: completed, no_answer, busy, failed, refused, asked_to_message.\n"
             "Оцени качество работы голосового AI-агента, а не продавца и не качество этого анализа. "
             "ai_quality_score: 1-100, если был содержательный разговор; null, если транскрипт пустой или звонок "
-            "не состоялся. Учитывай: следовал ли агент goal_ru, задал ли ключевые вопросы, получил ли конкретные "
-            "ответы или корректно зафиксировал отказ/неизвестно, не говорил ли слишком длинно, не завершил ли "
-            "разговор преждевременно, не выдумывал ли факты, использовал ли правильный язык. "
+            "не состоялся. Учитывай покрытие goal_answers: следовал ли агент goal_ru, задал ли ключевые вопросы, "
+            "получил ли конкретные ответы или корректно зафиксировал отказ/неизвестно, не говорил ли слишком "
+            "длинно, не завершил ли разговор преждевременно, не выдумывал ли факты, использовал ли правильный язык. "
             "ai_quality_reason верни коротко на русском: почему такая оценка.\n\n"
             f"goal_ru:\n{goal_ru[:4000]}\n\ntranscript:\n{transcript[:15000]}"
         )
