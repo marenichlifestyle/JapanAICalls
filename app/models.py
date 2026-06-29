@@ -302,3 +302,23 @@ class CallReport(Base):
 
     campaign: Mapped[RequestCallCampaign] = relationship(back_populates="reports")
     target: Mapped[DealerCallTarget] = relationship(back_populates="reports")
+
+
+class DealerPhoneContext(Base):
+    __tablename__ = "dealer_phone_contexts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    phone_e164: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    phone_region: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    last_dealer_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_campaign_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    last_target_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    last_report_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    last_called_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    successful_call_count: Mapped[int] = mapped_column(Integer, default=0)
+    context_items_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    context_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

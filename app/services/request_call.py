@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.keyboards import request_call_cancel_keyboard, request_call_next_keyboard
 from app.config import Settings
-from app.models import CallReport, DealerCallTarget, Job, RequestCallCampaign
+from app.models import CallReport, DealerCallTarget, DealerPhoneContext, Job, RequestCallCampaign
 from app.schemas import GoalGenerationResult, RequestCallReportResult
 from app.services.call_state import classify_twilio_create_failure, extract_twilio_error_code, sanitize_payload
 from app.services.elevenlabs_client import ElevenLabsService, ProviderCallCreateError
@@ -74,6 +74,33 @@ EMPTY_REPORT_VALUES = {
     "не выяснили",
 }
 REQUEST_CALL_FINALIZATION_LOCK_CLASS_ID = 62041
+PHONE_CONTEXT_MAX_ITEMS = 3
+PHONE_CONTEXT_PREFIX_MAX_WORDS = 70
+PHONE_CONTEXT_GOAL_MAX_WORDS = 180
+PHONE_CONTEXT_PREFIXES = {
+    "en": (
+        "Previous call context: We previously spoke with this number. "
+        "Briefly mention that we contacted them before, summarize the prior result, "
+        "then move to the new follow-up question."
+    ),
+    "ja": (
+        "前回の通話内容: 以前この番号と話しました。"
+        "最初に以前連絡したことを伝え、前回の結果を短く説明してから、今回の追加確認に進んでください。"
+    ),
+    "ru": (
+        "Предыдущий контекст: ранее уже связывались с этим номером. "
+        "Начни с того, что мы уже общались, кратко напомни прошлый результат и перейди к новому уточнению."
+    ),
+}
+PHONE_CONTEXT_TERMINAL_SKIP_STATUSES = {
+    "no_answer",
+    "busy",
+    "failed",
+    "call_create_failed",
+    "provider_timeout",
+    "timeout",
+    "canceled",
+}
 REQUEST_CAMPAIGN_INPUT_STATUSES = {
     "draft",
     "needs_country",
@@ -225,6 +252,13 @@ def _word_count(value: str | None) -> int:
     return len(re.findall(r"\S+", value or ""))
 
 
+def _limit_words(value: str | None, *, limit: int) -> str:
+    words = re.findall(r"\S+", value or "")
+    if len(words) <= limit:
+        return " ".join(words)
+    return " ".join(words[:limit]).rstrip() + "…"
+
+
 def _compact_value(value: str | None, *, limit: int = 220) -> str | None:
     cleaned = _clean_spaces(value or "")
     if cleaned.lower() in EMPTY_REPORT_VALUES:
@@ -249,6 +283,62 @@ def _join_compact_values(*values: str | None, limit: int = 260) -> str | None:
     if not parts:
         return None
     return _compact_value("; ".join(parts), limit=limit)
+
+
+def _is_meaningful_phone_context_report(report: CallReport) -> bool:
+    status = (report.call_status or "").strip().lower()
+    if status in PHONE_CONTEXT_TERMINAL_SKIP_STATUSES:
+        return False
+    if status in {"completed", "refused", "asked_to_message"}:
+        return True
+    return bool(report.reached_sales or _report_has_useful_result(report))
+
+
+def _phone_context_item_summary(item: dict[str, Any] | None) -> str | None:
+    if not item:
+        return None
+    parts = [
+        _compact_value(str(item.get("goal_summary") or ""), limit=170),
+        _compact_value(str(item.get("summary") or ""), limit=170),
+        _compact_value(str(item.get("availability") or ""), limit=120),
+        _compact_value(str(item.get("incoming") or ""), limit=120),
+        _compact_value(str(item.get("price") or ""), limit=120),
+        _compact_value(str(item.get("vin_or_stock") or ""), limit=120),
+        _compact_value(str(item.get("payment") or ""), limit=120),
+        _compact_value(str(item.get("paperwork") or ""), limit=120),
+        _compact_value(str(item.get("important_notes") or ""), limit=140),
+        _compact_value(str(item.get("next_action") or ""), limit=140),
+    ]
+    return _join_compact_values(*parts, limit=360)
+
+
+def _build_phone_context_summary(items: list[dict[str, Any]]) -> str | None:
+    summaries: list[str] = []
+    for item in items[:PHONE_CONTEXT_MAX_ITEMS]:
+        summary = _phone_context_item_summary(item)
+        if not summary:
+            continue
+        called_at = _compact_value(str(item.get("called_at") or ""), limit=24)
+        prefix = f"{called_at}: " if called_at else ""
+        summaries.append(prefix + summary)
+    return _compact_value(" | ".join(summaries), limit=900)
+
+
+def _goal_with_phone_context(base_goal: str, context: DealerPhoneContext | None, call_language: str | None) -> str:
+    context_summary = _compact_value(context.context_summary if context else None, limit=900)
+    if not context or not context_summary:
+        return base_goal
+    language = "ja" if call_language == "ja" else "en" if call_language == "en" else "ru"
+    prefix = PHONE_CONTEXT_PREFIXES[language]
+    result_label = {"en": "Prior result", "ja": "前回の結果", "ru": "Прошлый результат"}[language]
+    goal_label = {"en": "New call goal", "ja": "今回の目的", "ru": "Новая цель звонка"}[language]
+    context_text = _limit_words(context_summary, limit=PHONE_CONTEXT_PREFIX_MAX_WORDS)
+    goal = f"{prefix} {result_label}: {context_text}\n\n{goal_label}: {base_goal}"
+    if _word_count(goal) <= PHONE_CONTEXT_GOAL_MAX_WORDS:
+        return goal
+    allowed_prefix_words = max(20, PHONE_CONTEXT_GOAL_MAX_WORDS - _word_count(base_goal) - 18)
+    context_text = _limit_words(context_summary, limit=min(PHONE_CONTEXT_PREFIX_MAX_WORDS, allowed_prefix_words))
+    return f"{prefix} {result_label}: {context_text}\n\n{goal_label}: {base_goal}"
 
 
 def _status_label(status: str | None) -> str:
@@ -842,8 +932,13 @@ class RequestCallService:
             return
 
         result.status = "ready"
+        contexts = await self._phone_contexts_by_phone(session, [target.phone_e164 for target in targets])
         for target in targets:
-            target.goal_ru = result.goal_ru
+            target.goal_ru = _goal_with_phone_context(
+                result.goal_ru,
+                contexts.get(target.phone_e164),
+                campaign.call_language,
+            )
         first_meta = result.model_dump()
         campaign.goal_meta_json = first_meta
         campaign.normalized_goal_summary = self._goal_summary(campaign.raw_user_goal or "", first_meta)
@@ -978,6 +1073,18 @@ class RequestCallService:
     async def list_reports(self, session: AsyncSession, campaign_id: int) -> list[CallReport]:
         stmt = select(CallReport).where(CallReport.campaign_id == campaign_id).order_by(CallReport.id)
         return list((await session.execute(stmt)).scalars().all())
+
+    async def _phone_contexts_by_phone(
+        self,
+        session: AsyncSession,
+        phones: list[str],
+    ) -> dict[str, DealerPhoneContext]:
+        unique_phones = sorted({phone for phone in phones if phone})
+        if not unique_phones:
+            return {}
+        stmt = select(DealerPhoneContext).where(DealerPhoneContext.phone_e164.in_(unique_phones))
+        rows = list((await session.execute(stmt)).scalars().all())
+        return {row.phone_e164: row for row in rows}
 
     async def start_next_call(self, *, session: AsyncSession, campaign: RequestCallCampaign, bot: Bot) -> Job | None:
         await session.refresh(campaign)
@@ -1194,7 +1301,14 @@ class RequestCallService:
                 await self.send_target_report(session=session, campaign=campaign, target=target, bot=bot, job=job)
             return
         report = await self._extract_call_report(transcript=transcript, goal_ru=job.request_goal_ru or target.goal_ru or "")
-        await self._persist_report(session=session, campaign=campaign, target=target, report=report)
+        report_row = await self._persist_report(session=session, campaign=campaign, target=target, report=report)
+        await self._update_dealer_phone_context(
+            session=session,
+            campaign=campaign,
+            target=target,
+            report=report_row,
+            goal_ru=job.request_goal_ru or target.goal_ru or "",
+        )
         target.status = report.call_status if report.call_status != "completed" else "completed"
         job.status = "completed"
         job.call_status = report.call_status
@@ -1356,6 +1470,77 @@ class RequestCallService:
         await session.flush()
         return row
 
+    async def _update_dealer_phone_context(
+        self,
+        *,
+        session: AsyncSession,
+        campaign: RequestCallCampaign,
+        target: DealerCallTarget,
+        report: CallReport,
+        goal_ru: str,
+    ) -> DealerPhoneContext | None:
+        if not target.phone_e164 or not _is_meaningful_phone_context_report(report):
+            return None
+        stmt = select(DealerPhoneContext).where(DealerPhoneContext.phone_e164 == target.phone_e164).limit(1)
+        context = (await session.execute(stmt)).scalar_one_or_none()
+        if context is None:
+            context = DealerPhoneContext(
+                phone_e164=target.phone_e164,
+                phone_region=target.phone_region or campaign.phone_region,
+                successful_call_count=0,
+                context_items_json=[],
+            )
+            session.add(context)
+            await session.flush()
+
+        now = datetime.now(timezone.utc)
+        item = {
+            "called_at": now.isoformat(timespec="seconds"),
+            "campaign_id": campaign.id,
+            "target_id": target.id,
+            "report_id": report.id,
+            "call_language": campaign.call_language or "en",
+            "dealer_name": target.dealer_name,
+            "goal_summary": _compact_value(goal_ru, limit=260),
+            "summary": _compact_value(report.summary, limit=220),
+            "availability": _compact_value(report.availability_result, limit=160),
+            "incoming": _compact_value(report.incoming_result, limit=160),
+            "price": _compact_value(report.price_result, limit=160),
+            "configuration": _compact_value(report.configuration_result, limit=160),
+            "vin_or_stock": _compact_value(report.vin_or_stock_result, limit=160),
+            "payment": _compact_value(report.payment_result, limit=160),
+            "paperwork": _compact_value(report.paperwork_result, limit=160),
+            "important_notes": _compact_value(report.important_notes, limit=180),
+            "next_action": _compact_value(report.next_action, limit=180),
+        }
+        previous_items = context.context_items_json or []
+        already_recorded = any(row.get("report_id") == report.id for row in previous_items)
+        items = [item]
+        items.extend(row for row in previous_items if row.get("report_id") != report.id)
+        items = items[:PHONE_CONTEXT_MAX_ITEMS]
+        context.phone_region = target.phone_region or campaign.phone_region or context.phone_region
+        context.last_dealer_name = target.dealer_name
+        context.last_campaign_id = campaign.id
+        context.last_target_id = target.id
+        context.last_report_id = report.id
+        context.last_called_at = now
+        if not already_recorded:
+            context.successful_call_count = int(context.successful_call_count or 0) + 1
+        context.context_items_json = items
+        context.context_summary = _build_phone_context_summary(items)
+        await session.flush()
+        logger.info(
+            "dealer phone context updated",
+            extra={
+                "campaign_id": campaign.id,
+                "target_id": target.id,
+                "report_id": report.id,
+                "phone_e164": target.phone_e164,
+                "items": len(items),
+            },
+        )
+        return context
+
     async def _create_status_report(
         self,
         *,
@@ -1515,6 +1700,13 @@ def build_request_confirmation_text(campaign: RequestCallCampaign, targets: list
     for idx, target in enumerate(targets, start=1):
         city = f", {target.city}" if target.city else ""
         lines.append(f"{idx}. {target.dealer_name}{city}, {target.phone_e164}")
+    targets_with_context = [
+        target.phone_e164
+        for target in targets
+        if any(prefix in (target.goal_ru or "") for prefix in PHONE_CONTEXT_PREFIXES.values())
+    ]
+    if targets_with_context:
+        lines.extend(["", f"Есть предыдущий контекст по номеру: {', '.join(targets_with_context)}"])
     language_label = "японский" if campaign.call_language == "ja" else "английский"
     lines.extend(["", f"Язык звонка: {language_label}"])
     context_summary = _vehicle_context_summary(campaign.vehicle_context_json or [])

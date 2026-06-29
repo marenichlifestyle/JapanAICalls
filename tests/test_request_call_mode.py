@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings
-from app.models import Base, CallReport, Job
+from app.models import Base, CallReport, DealerPhoneContext, Job
 from app.repositories import (
     create_request_campaign,
     get_latest_input_request_campaign,
@@ -1178,6 +1178,190 @@ async def test_request_campaign_generates_goal_once_for_all_targets() -> None:
         assert targets[0].goal_ru == targets[1].goal_ru
         assert "Duval Ford Jacksonville" not in targets[0].goal_ru
         assert "AutoNation Ford Jacksonville" not in targets[1].goal_ru
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dealer_phone_context_is_created_and_limited_to_three_items() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="Duval Ford Jacksonville +1 (904) 387-6541\nЗадача: узнать наличие Ford Raptor R.",
+        )
+        target = (await service.list_targets(session, campaign.id))[0]
+
+        for idx in range(4):
+            report = await service._persist_report(
+                session=session,
+                campaign=campaign,
+                target=target,
+                report=RequestCallReportResult(
+                    call_status="completed",
+                    reached_sales=True,
+                    summary=f"Итог звонка {idx}",
+                    availability_result="есть ответ по наличию",
+                    incoming_result="есть поставка",
+                    price_result="$70,000",
+                    next_action="перезвонить с уточнением",
+                ),
+            )
+            await service._update_dealer_phone_context(
+                session=session,
+                campaign=campaign,
+                target=target,
+                report=report,
+                goal_ru=target.goal_ru or "",
+            )
+
+        context = (
+            await session.execute(select(DealerPhoneContext).where(DealerPhoneContext.phone_e164 == "+19043876541"))
+        ).scalar_one()
+        assert context.successful_call_count == 4
+        assert len(context.context_items_json) == 3
+        assert context.context_items_json[0]["summary"] == "Итог звонка 3"
+        assert "Итог звонка 3" in context.context_summary
+        assert "Итог звонка 0" not in context.context_summary
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dealer_phone_context_skips_no_answer_busy_and_failed_reports() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    async with session_maker() as session:
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="Duval Ford Jacksonville +1 (904) 387-6541\nЗадача: узнать наличие Ford Raptor R.",
+        )
+        target = (await service.list_targets(session, campaign.id))[0]
+        for status in ("no_answer", "busy", "failed", "call_create_failed"):
+            report = await service._create_status_report(
+                session=session,
+                campaign=campaign,
+                target=target,
+                call_status=status,
+                summary=f"status {status}",
+            )
+            assert (
+                await service._update_dealer_phone_context(
+                    session=session,
+                    campaign=campaign,
+                    target=target,
+                    report=report,
+                    goal_ru=target.goal_ru or "",
+                )
+            ) is None
+        rows = (await session.execute(select(DealerPhoneContext))).scalars().all()
+        assert rows == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_previous_phone_context_is_added_to_repeated_target_goal_only() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    openai = FakeOpenAI(settings)
+    service = RequestCallService(
+        settings=settings,
+        openai_service=openai,
+        elevenlabs_service=FakeEleven(settings),
+    )
+    async with session_maker() as session:
+        session.add(
+            DealerPhoneContext(
+                phone_e164="+19043876541",
+                phone_region="US",
+                last_dealer_name="Duval Ford Jacksonville",
+                successful_call_count=1,
+                context_items_json=[
+                    {
+                        "called_at": "2026-06-29T10:00:00+00:00",
+                        "summary": "дилер подтвердил ближайшую поставку",
+                        "price": "$70,000",
+                        "next_action": "уточнить dealer-to-dealer покупку",
+                    }
+                ],
+                context_summary="дилер подтвердил ближайшую поставку; $70,000; уточнить dealer-to-dealer покупку",
+            )
+        )
+        await session.commit()
+
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "US")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text=(
+                "Duval Ford Jacksonville +1 (904) 387-6541\n"
+                "AutoNation Ford Jacksonville +1 (904) 513-3392\n"
+                "Задача: уточнить dealer to dealer покупку."
+            ),
+        )
+        targets = await service.list_targets(session, campaign.id)
+        assert len(openai.goal_calls) == 1
+        repeated = next(target for target in targets if target.phone_e164 == "+19043876541")
+        new = next(target for target in targets if target.phone_e164 == "+19045133392")
+        assert repeated.goal_ru.startswith("Previous call context:")
+        assert "we contacted them before" in repeated.goal_ru
+        assert "New call goal:" in repeated.goal_ru
+        assert "Call the sales department about Ford Raptor R" in repeated.goal_ru
+        assert not new.goal_ru.startswith("Previous call context:")
+        confirmation = build_request_confirmation_text(campaign, targets)
+        assert "Есть предыдущий контекст по номеру: +19043876541" in confirmation
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_previous_phone_context_uses_japanese_prefix_for_ja_calls() -> None:
+    engine, session_maker = await _session_maker()
+    settings = _settings()
+    service = RequestCallService(
+        settings=settings,
+        openai_service=FakeOpenAI(settings),
+        elevenlabs_service=FakeEleven(settings),
+    )
+    async with session_maker() as session:
+        session.add(
+            DealerPhoneContext(
+                phone_e164="+81312345678",
+                phone_region="JP",
+                last_dealer_name="東京販売",
+                successful_call_count=1,
+                context_items_json=[{"summary": "前回は在庫確認をした"}],
+                context_summary="前回は在庫確認をした",
+            )
+        )
+        await session.commit()
+
+        campaign = await service.create_draft(session=session, chat_id=10, user_id=1)
+        campaign = await _select_request_country(session, campaign, "JP")
+        campaign = await service.update_campaign_from_text(
+            session=session,
+            campaign=campaign,
+            text="東京販売 03-1234-5678\nタスク: 追加で価格を確認する。",
+        )
+        target = (await service.list_targets(session, campaign.id))[0]
+        assert target.goal_ru.startswith("前回の通話内容:")
+        assert "今回の目的:" in target.goal_ru
+        assert "販売部門" in target.goal_ru
     await engine.dispose()
 
 
