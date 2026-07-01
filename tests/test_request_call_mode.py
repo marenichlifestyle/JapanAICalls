@@ -542,11 +542,58 @@ async def test_goal_generation_prompt_requires_follow_up_questions() -> None:
     assert "do not replace the user's request with 'no questions'" in openai.last_prompt
     assert "dealer-to-dealer purchase is possible" in openai.last_prompt
     assert "Call the sales department about" in openai.last_prompt
-    assert "availability or incoming ETA" in openai.last_prompt
+    assert "Ask only questions needed for the user's stated goal" in openai.last_prompt
+    assert "do not add a universal dealership questionnaire" in openai.last_prompt
+    assert "do not add markup/MSRP/deposit questions" in openai.last_prompt
+    assert "dealer-to-dealer/no-tax tasks" in openai.last_prompt
+    assert "what resale/wholesale/dealer documents are required" in openai.last_prompt
+    assert "markup/MSRP/market adjustment only for new/order/allocation/rare incoming vehicles" in openai.last_prompt
+    assert "fees/tax/OTD/deposit/hold/paperwork only when the user asks" in openai.last_prompt
+    assert "nearest allocation or quota" not in openai.last_prompt
     assert "keep the call natural" in openai.last_prompt
     assert "Do not end the call" not in openai.last_prompt
     assert "a Ford dealership" not in openai.last_prompt
     assert "a Jeep dealership" not in openai.last_prompt
+
+
+@pytest.mark.asyncio
+async def test_goal_generation_prompt_keeps_used_car_dealer_to_dealer_focused() -> None:
+    settings = _settings()
+    openai = CapturingOpenAI(settings)
+    await openai.generate_goal_ru(
+        dealer_name="Dealer",
+        city=None,
+        phone_e164="+13055550100",
+        raw_user_goal=(
+            "Уточнить, что он есть в наличии белый на белом салоне, состояние, могут ли отправить Car Fax "
+            "и могут ли продать dealer to dealer без tax на компанию дилерскую во Флориде."
+        ),
+        call_language="en",
+        vehicle_context=[{"vehicle_title": "Used 2025 RAM 1500 Tungsten", "color": "white"}],
+    )
+    assert "specific used vehicle" in openai.last_prompt
+    assert "condition, vehicle history/Carfax" in openai.last_prompt
+    assert "dealer-to-dealer no tax" in openai.last_prompt
+    assert "do not add markup/MSRP/deposit questions" in openai.last_prompt
+
+
+@pytest.mark.asyncio
+async def test_goal_generation_prompt_has_same_conditional_rules_for_ja() -> None:
+    settings = _settings()
+    openai = CapturingOpenAI(settings)
+    await openai.generate_goal_ru(
+        dealer_name="Tokyo Dealer",
+        city=None,
+        phone_e164="+81312345678",
+        raw_user_goal="在庫、状態、業販で買えるか確認する。",
+        call_language="ja",
+        vehicle_context=[{"vehicle_title": "中古 Lexus LC", "color": "white"}],
+    )
+    assert "Japanese-speaking voice agent" in openai.last_prompt
+    assert "Ask only questions needed for the user's stated goal" in openai.last_prompt
+    assert "specific used vehicle" in openai.last_prompt
+    assert "dealer-to-dealer/no-tax tasks" in openai.last_prompt
+    assert "do not add markup/MSRP/deposit questions" in openai.last_prompt
 
 
 @pytest.mark.asyncio
